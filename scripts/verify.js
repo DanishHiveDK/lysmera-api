@@ -145,6 +145,9 @@ async function main() {
       return { orgId: org.rows[0].id, userId: user.rows[0].id };
     };
     const orgA = await mkOrg('Firma A ApS', 'a@example.dk');
+    // Pladserne er forudbetalte. Firma A skal kunne tage et helt hold ind i
+    // afsnittene om team og invitationer, så det har pladser nok på forhånd.
+    await db.query('UPDATE organizations SET requested_seats = 20 WHERE id = $1', [orgA.orgId]);
     const orgB = await mkOrg('Firma B ApS', 'b@example.dk');
     check('to organisationer oprettet', orgA.orgId !== orgB.orgId);
 
@@ -748,6 +751,173 @@ async function main() {
       JSON.stringify(stadier?.map((s) => s.value)));
     check('selskabsformer bruger numeriske koder',
       typeof opts.json?.companyForms?.[0]?.value === 'number', JSON.stringify(opts.json?.companyForms?.[0]));
+
+    // ── Forudbetalte pladser ─────────────────────────────────────────────────
+    section('Forudbetalte pladser');
+    cvr.lookupCompany = async (nr) => ({
+      cvr: nr, name: `Virksomhed ${nr} ApS`, city: 'Odense', advertisingProtected: false,
+    });
+
+    const pladsOpret = await call('/api/auth/register', {
+      method: 'POST',
+      body: { name: 'Plads Ejer', cvr: '87654321', email: 'plads@example.dk',
+              password: 'langnokkode123', pladser: 2 } });
+    check('ekstra brugere kan vælges ved oprettelsen', pladsOpret.status === 201,
+      JSON.stringify(pladsOpret.json));
+    const pladsToken = pladsOpret.json?.token;
+
+    const forMangeValgt = await call('/api/auth/register', {
+      method: 'POST',
+      body: { name: 'For Mange', cvr: '87654322', email: 'formange@example.dk',
+              password: 'langnokkode123', pladser: 999 } });
+    check('et urimeligt antal pladser afvises', forMangeValgt.status === 400);
+
+    const pladsStatus = await call('/api/billing/status', { token: pladsToken });
+    check('status viser de valgte pladser, kapaciteten og prisen',
+      pladsStatus.json?.team?.betaltePladser === 2
+        && pladsStatus.json?.team?.kapacitet === 3
+        && pladsStatus.json?.team?.ialt === 179 + 2 * 99,
+      JSON.stringify(pladsStatus.json?.team));
+
+    const pladsKollega = (n) => call('/api/auth/team', {
+      method: 'POST', token: pladsToken,
+      body: { name: `Plads ${n}`, email: `plads${n}@example.dk`, password: 'langnokkode123' } });
+    check('første købte plads kan bruges', (await pladsKollega(1)).status === 201);
+    check('anden købte plads kan bruges', (await pladsKollega(2)).status === 201);
+    const pladsFuld = await pladsKollega(3);
+    check('når pladserne er brugt, afvises flere brugere',
+      pladsFuld.status === 409 && pladsFuld.json.code === 'NO_SEATS', JSON.stringify(pladsFuld.json));
+    const pladsFuldInv = await call('/api/auth/team/invitations', {
+      method: 'POST', token: pladsToken, body: { name: 'Inv', email: 'pladsinv@example.dk' } });
+    check('en invitation kræver også en ledig plads',
+      pladsFuldInv.status === 409 && pladsFuldInv.json.code === 'NO_SEATS');
+
+    const underBrugt = await call('/api/billing/seats', {
+      method: 'POST', token: pladsToken, body: { pladser: 1 } });
+    check('pladserne kan ikke sættes under det antal, der er i brug',
+      underBrugt.status === 409 && underBrugt.json.code === 'SEATS_IN_USE', JSON.stringify(underBrugt.json));
+    const ugyldigtAntal = await call('/api/billing/seats', {
+      method: 'POST', token: pladsToken, body: { pladser: -1 } });
+    check('et negativt antal afvises', ugyldigtAntal.status === 400);
+
+    const flerePladser = await call('/api/billing/seats', {
+      method: 'POST', token: pladsToken, body: { pladser: 4 } });
+    check('uden abonnement gemmes det nye antal til betalingen',
+      flerePladser.status === 200 && flerePladser.json?.afventerBetaling === true,
+      JSON.stringify(flerePladser.json));
+    check('den nye plads kan bruges med det samme', (await pladsKollega(3)).status === 201);
+
+    // Token laves direkte: login er begrænset til ti forsøg i kvarteret, og
+    // dem har testen allerede brugt.
+    const { signToken } = require('../middleware/auth');
+    const pladsSaelger = (await db.query(
+      "SELECT id, org_id, email, role, name FROM users WHERE email = 'plads1@example.dk'")).rows[0];
+    const pladsSaelgerToken = signToken(pladsSaelger);
+    const saelgerKoeber = await call('/api/billing/seats', {
+      method: 'POST', token: pladsSaelgerToken, body: { pladser: 10 } });
+    check('en sælger kan ikke købe pladser', saelgerKoeber.status === 403, String(saelgerKoeber.status));
+
+    // En betalende konto: pladserne kommer fra abonnementet, ikke fra ønsket.
+    const pladsOrgId = (await db.query(
+      `SELECT org_id FROM users WHERE email = 'plads@example.dk'`)).rows[0].org_id;
+    await db.query(
+      `UPDATE organizations SET stripe_subscription_id = 'sub_test', subscription_status = 'active',
+              paid_seats = 3 WHERE id = $1`, [pladsOrgId]);
+    const betaltStatus = await call('/api/billing/status', { token: pladsToken });
+    check('en betalende konto har de pladser, abonnementet har',
+      betaltStatus.json?.team?.betaltePladser === 3 && betaltStatus.json?.team?.kapacitet === 4
+        && betaltStatus.json?.team?.ledige === 0,
+      JSON.stringify(betaltStatus.json?.team));
+    check('en fuld betalende konto afviser flere', (await pladsKollega(4)).status === 409);
+    const udenStripe = await call('/api/billing/seats', {
+      method: 'POST', token: pladsToken, body: { pladser: 5 } });
+    check('uden Stripe kan et abonnement ikke ændres, og det siges ærligt',
+      udenStripe.status === 503, JSON.stringify(udenStripe.json));
+
+    // ── Ringelister pr. medarbejder ──────────────────────────────────────────
+    section('Ringelister pr. medarbejder');
+    const tokenMaria = mariaAccept.json?.token;
+    const mariaId = mariaAccept.json?.user?.id;
+    const tokenTom = tomAccept.json?.token;
+    const tomId = tomAccept.json?.user?.id;
+
+    const kampagne = await call('/api/lists', {
+      method: 'POST', token: tokenA,
+      body: { name: 'Kampagne Maria', filters: { industryCodes: ['620200'], region: 'fyn' },
+              limit: 1000, assignedTo: mariaId } });
+    check('ejeren kan oprette en liste direkte til en medarbejder',
+      kampagne.status === 201 && kampagne.json?.list?.assigned_to === mariaId,
+      JSON.stringify(kampagne.json).slice(0, 200));
+    const kampagneId = kampagne.json?.list?.id;
+    const importeret = kampagne.json?.imported ?? 0;
+
+    const mariasLeads = await db.query(
+      'SELECT COUNT(*)::int AS n FROM leads WHERE list_id = $1 AND assigned_to = $2', [kampagneId, mariaId]);
+    check('listens virksomheder følger med til medarbejderen',
+      importeret > 0 && mariasLeads.rows[0].n === importeret, `${mariasLeads.rows[0].n} af ${importeret}`);
+
+    const mariasLister = await call('/api/lists', { token: tokenMaria });
+    check('medarbejderen ser listen med sit navn på',
+      mariasLister.json?.lists?.some((l) => l.id === kampagneId && l.assigned_to_name === 'Maria Berg'));
+    const tomsLister = await call('/api/lists', { token: tokenTom });
+    check('en kollega ser ikke listen',
+      Array.isArray(tomsLister.json?.lists) && !tomsLister.json.lists.some((l) => l.id === kampagneId));
+    check('en kollega kan ikke åbne listen',
+      (await call(`/api/lists/${kampagneId}`, { token: tokenTom })).status === 404);
+    check('en kollega kan ikke hente listens virksomheder',
+      (await call(`/api/lists/${kampagneId}/leads`, { token: tokenTom })).status === 404);
+    const tomsKoe = await call(`/api/leads/next?listId=${kampagneId}`, { token: tokenTom });
+    check('listen er tom i kollegaens ringekø', tomsKoe.json?.lead === null, JSON.stringify(tomsKoe.json).slice(0, 120));
+    const mariasKoe = await call(`/api/leads/next?listId=${kampagneId}`, { token: tokenMaria });
+    check('medarbejderen får hele listen i sin ringekø',
+      !!mariasKoe.json?.lead && mariasKoe.json.remaining === importeret, `remaining: ${mariasKoe.json?.remaining}`);
+
+    const saelgerSender = await call(`/api/lists/${kampagneId}`, {
+      method: 'PATCH', token: tokenMaria, body: { assignedTo: tomId } });
+    check('kun ejeren kan sende lister ud', saelgerSender.status === 403);
+    const fremmedModtager = await call(`/api/lists/${kampagneId}`, {
+      method: 'PATCH', token: tokenA, body: { assignedTo: orgB.userId } });
+    check('en liste kan ikke sendes til en fra en anden virksomhed', fremmedModtager.status === 400);
+
+    const videre = await call(`/api/lists/${kampagneId}`, {
+      method: 'PATCH', token: tokenA, body: { assignedTo: tomId } });
+    check('ejeren kan sende listen videre til en anden',
+      videre.status === 200 && videre.json?.list?.assigned_to === tomId && videre.json?.tildelteLeads === importeret,
+      JSON.stringify(videre.json));
+    check('den tidligere medarbejder kan ikke længere åbne den',
+      (await call(`/api/lists/${kampagneId}`, { token: tokenMaria })).status === 404);
+
+    const tilbage = await call(`/api/lists/${kampagneId}`, {
+      method: 'PATCH', token: tokenA, body: { assignedTo: null } });
+    const stadigTildelt = await db.query(
+      'SELECT COUNT(*)::int AS n FROM leads WHERE list_id = $1 AND assigned_to IS NOT NULL', [kampagneId]);
+    check('en liste taget tilbage frigiver sine åbne virksomheder',
+      tilbage.status === 200 && tilbage.json?.list?.assigned_to === null && stadigTildelt.rows[0].n === 0,
+      `${stadigTildelt.rows[0].n} stadig tildelt`);
+    check('en fælles liste kan ses af alle i teamet',
+      (await call(`/api/lists/${kampagneId}`, { token: tokenTom })).status === 200);
+
+    await call(`/api/lists/${kampagneId}`, { method: 'PATCH', token: tokenA, body: { assignedTo: mariaId } });
+    const teamOverblik = await call('/api/auth/team', { token: tokenA });
+    const mariaRaekke = teamOverblik.json?.users?.find((u) => u.id === mariaId);
+    check('teamet viser medarbejderens lister og åbne virksomheder',
+      mariaRaekke?.lister === 1 && mariaRaekke?.aabne_leads === importeret, JSON.stringify(mariaRaekke));
+
+    const kunMaria = await call(`/api/lists?assignedTo=${mariaId}`, { token: tokenA });
+    check('ejeren kan se én medarbejders lister',
+      kunMaria.json?.lists?.length === 1 && kunMaria.json.lists[0].id === kampagneId,
+      JSON.stringify(kunMaria.json?.lists?.map((l) => l.id)));
+    const ikkeSendtUd = await call('/api/lists?assignedTo=none', { token: tokenA });
+    check('ejeren kan se de lister, der ikke er sendt ud',
+      ikkeSendtUd.json?.lists?.every((l) => l.assigned_to === null)
+        && !ikkeSendtUd.json?.lists?.some((l) => l.id === kampagneId));
+
+    const nyVirksomhed = await call(`/api/lists/${kampagneId}/leads`, {
+      method: 'POST', token: tokenA, body: { cvr: '55555555' } });
+    const arvet = await db.query(
+      'SELECT assigned_to FROM leads WHERE list_id = $1 AND cvr = $2', [kampagneId, '55555555']);
+    check('nye virksomheder i listen får listens medarbejder',
+      arvet.rows[0]?.assigned_to === mariaId, JSON.stringify(nyVirksomhed.json));
 
     section('Sletning');
     await call(`/api/lists/${listId}`, { method: 'DELETE', token: tokenA });

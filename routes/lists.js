@@ -8,8 +8,10 @@ const cvr     = require('../services/cvrService');
 const { sanitizeFilters, isEmptyFilter } = require('../services/filterSchema');
 const { authenticate } = require('../middleware/auth');
 const { handleCvrError } = require('./search');
-const { STATUS_VALUES } = require('../config/cvrOptions');
+const { STATUS_VALUES, TERMINAL_STATUSES } = require('../config/cvrOptions');
 const { toCsv } = require('../services/csv');
+const mailService = require('../services/mailService');
+const appUrl = require('../config/appUrl');
 
 const router = express.Router();
 
@@ -46,6 +48,8 @@ const LEAD_INSERT_COLUMNS = [
   ['purpose',            (c) => c.purpose],
   ['capital',            (c) => c.capital],
   ['capital_currency',   (c) => c.capitalCurrency],
+  // Er listen sendt til en medarbejder, er nye virksomheder i den også hendes.
+  ['assigned_to',        (c, ctx) => ctx.assignedTo],
 ];
 
 /**
@@ -77,11 +81,15 @@ async function insertLeads(client, { orgId, listId, companies }) {
   const rows = companies.filter((c) => c.cvr && !c.advertisingProtected);
   if (!rows.length) return 0;
 
+  const { rows: [liste] } = await client.query(
+    'SELECT assigned_to FROM lead_lists WHERE id = $1', [listId]);
+  const assignedTo = liste?.assigned_to ?? null;
+
   const width = LEAD_INSERT_COLUMNS.length;
   const values = [];
   const placeholders = rows.map((company, i) => {
     const base = i * width;
-    for (const [, read] of LEAD_INSERT_COLUMNS) values.push(read(company, { orgId, listId }));
+    for (const [, read] of LEAD_INSERT_COLUMNS) values.push(read(company, { orgId, listId, assignedTo }));
     return `(${Array.from({ length: width }, (_, j) => `$${base + j + 1}`).join(', ')})`;
   });
 
@@ -94,23 +102,82 @@ async function insertLeads(client, { orgId, listId, companies }) {
   return rowCount;
 }
 
+/**
+ * Må brugeren se listen? En ejer ser alle organisationens lister. En sælger
+ * ser sine egne og dem, der ikke er sendt til nogen. En liste sendt til en
+ * kollega er kollegaens, og for alle andre findes den ikke.
+ */
+function maaSe(req, liste) {
+  return req.user.role === 'owner'
+    || liste.assigned_to == null
+    || liste.assigned_to === req.user.id;
+}
+
+/** Listen, hvis den findes i organisationen og brugeren må se den. Ellers null. */
+async function hentListe(req, id, kolonner = 'id, name') {
+  const { rows } = await db.query(
+    `SELECT ${kolonner}, assigned_to FROM lead_lists WHERE id = $1 AND org_id = $2`, [id, req.orgId]);
+  return rows[0] && maaSe(req, rows[0]) ? rows[0] : null;
+}
+
+/** En aktiv kollega i samme organisation, som en liste kan sendes til. */
+async function findModtager(req, id) {
+  const n = Number(id);
+  if (!Number.isInteger(n)) return null;
+  const { rows } = await db.query(
+    'SELECT id, name, email FROM users WHERE id = $1 AND org_id = $2 AND is_active', [n, req.orgId]);
+  return rows[0] ?? null;
+}
+
+/** Mail til medarbejderen om en ny liste. Aldrig til den, der selv sendte den. */
+async function giBesked(req, modtager, liste, antal) {
+  if (!modtager || modtager.id === req.user.id) return false;
+  return mailService.sendListeTildelt({
+    til: modtager.email,
+    navn: modtager.name,
+    listeNavn: liste.name,
+    antal,
+    tildeltAf: req.user.name,
+    link: `${appUrl()}/lister/${liste.id}`,
+  });
+}
+
 // ── GET /api/lists ───────────────────────────────────────────────────────────
 router.get('/lists', authenticate, async (req, res) => {
+  const params = [req.orgId, TERMINAL_STATUSES];
+  const where = ['l.org_id = $1', 'l.archived_at IS NULL'];
+
+  if (req.user.role !== 'owner') {
+    params.push(req.user.id);
+    where.push(`(l.assigned_to IS NULL OR l.assigned_to = $${params.length})`);
+  } else if (req.query.assignedTo) {
+    // Ejeren kan se én medarbejders lister, eller dem der ikke er sendt ud.
+    if (req.query.assignedTo === 'none') {
+      where.push('l.assigned_to IS NULL');
+    } else {
+      params.push(Number(req.query.assignedTo) || 0);
+      where.push(`l.assigned_to = $${params.length}`);
+    }
+  }
+
   try {
     const { rows } = await db.query(
       `SELECT l.id, l.name, l.description, l.filters, l.created_at, l.archived_at,
+              l.assigned_to, l.assigned_at, a.name AS assigned_to_name,
               u.name AS created_by_name,
               COUNT(ld.id)                                              AS lead_count,
               COUNT(ld.id) FILTER (WHERE ld.status = 'new')             AS new_count,
               COUNT(ld.id) FILTER (WHERE ld.call_count > 0)             AS called_count,
+              COUNT(ld.id) FILTER (WHERE ld.status <> ALL($2::text[])) AS open_count,
               COUNT(ld.id) FILTER (WHERE ld.status IN ('interested','meeting_booked','won')) AS positive_count
          FROM lead_lists l
          LEFT JOIN users u  ON u.id  = l.created_by
+         LEFT JOIN users a  ON a.id  = l.assigned_to
          LEFT JOIN leads ld ON ld.list_id = l.id
-        WHERE l.org_id = $1 AND l.archived_at IS NULL
-        GROUP BY l.id, u.name
+        WHERE ${where.join(' AND ')}
+        GROUP BY l.id, u.name, a.name
         ORDER BY l.created_at DESC`,
-      [req.orgId]
+      params
     );
     return res.json({ lists: rows });
   } catch (err) {
@@ -124,16 +191,31 @@ router.post('/lists', authenticate, async (req, res) => {
   const name = String(req.body?.name ?? '').trim();
   if (!name) return res.status(400).json({ error: 'Giv listen et navn.' });
 
+  // Ejeren kan sende listen til en medarbejder, allerede når den oprettes.
+  let modtager = null;
+  if (req.body?.assignedTo != null) {
+    if (req.user.role !== 'owner') {
+      return res.status(403).json({ error: 'Kun ejeren kan sende lister ud.' });
+    }
+    try {
+      modtager = await findModtager(req, req.body.assignedTo);
+    } catch (err) {
+      console.error('[lists:create:modtager]', err.message);
+      return res.status(500).json({ error: 'Kunne ikke oprette listen.' });
+    }
+    if (!modtager) return res.status(400).json({ error: 'Medarbejderen findes ikke eller er deaktiveret.' });
+  }
+
   // En tom liste at samle enkelte virksomheder i. Filterkravet nedenfor er
   // der for at ingen kan trække hele registret ud ved et uheld — det gælder
   // ikke her, hvor der ikke hentes noget overhovedet.
   if (req.body?.empty === true) {
     try {
       const { rows } = await db.query(
-        `INSERT INTO lead_lists (org_id, name, description, filters, created_by)
-         VALUES ($1, $2, $3, '{}'::jsonb, $4)
-         RETURNING id, name, description, filters, created_at`,
-        [req.orgId, name, String(req.body?.description ?? '').trim() || null, req.user.id]
+        `INSERT INTO lead_lists (org_id, name, description, filters, created_by, assigned_to, assigned_at)
+         VALUES ($1, $2, $3, '{}'::jsonb, $4, $5, CASE WHEN $5::int IS NULL THEN NULL ELSE NOW() END)
+         RETURNING id, name, description, filters, created_at, assigned_to`,
+        [req.orgId, name, String(req.body?.description ?? '').trim() || null, req.user.id, modtager?.id ?? null]
       );
       return res.status(201).json({ list: rows[0], imported: 0, matched: 0, fetched: 0 });
     } catch (err) {
@@ -156,10 +238,11 @@ router.post('/lists', authenticate, async (req, res) => {
     // Create the list first so each scroll batch can be written straight in
     // rather than buffering the whole extraction in memory.
     const { rows } = await db.query(
-      `INSERT INTO lead_lists (org_id, name, description, filters, created_by)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, name, description, filters, created_at`,
+      `INSERT INTO lead_lists (org_id, name, description, filters, created_by, assigned_to, assigned_at)
+       VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6::int IS NULL THEN NULL ELSE NOW() END)
+       RETURNING id, name, description, filters, created_at, assigned_to`,
       [req.orgId, name, String(req.body?.description ?? '').trim() || null,
-       JSON.stringify(filters), req.user.id]
+       JSON.stringify(filters), req.user.id, modtager?.id ?? null]
     );
     const list = rows[0];
 
@@ -194,8 +277,11 @@ router.post('/lists', authenticate, async (req, res) => {
         },
       });
 
+      const mailSendt = inserted > 0 ? await giBesked(req, modtager, list, inserted) : false;
+
       return res.status(201).json({
         list,
+        mailSendt,
         imported: inserted,
         matched: total,
         fetched,
@@ -221,12 +307,10 @@ router.post('/lists/:id/refresh', authenticate, async (req, res) => {
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Ugyldigt liste-id.' });
 
   try {
-    const { rows } = await db.query(
-      'SELECT id, filters FROM lead_lists WHERE id = $1 AND org_id = $2', [id, req.orgId]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
+    const liste = await hentListe(req, id, 'id, filters');
+    if (!liste) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
 
-    const filters = sanitizeFilters(rows[0].filters ?? {});
+    const filters = sanitizeFilters(liste.filters ?? {});
     const limit = Math.min(Math.max(Number(req.body?.limit) || 1000, 1), MAX_EXTRACT);
 
     let inserted = 0;
@@ -256,10 +340,14 @@ router.get('/lists/:id', authenticate, async (req, res) => {
 
   try {
     const { rows } = await db.query(
-      'SELECT id, name, description, filters, created_at FROM lead_lists WHERE id = $1 AND org_id = $2',
+      `SELECT l.id, l.name, l.description, l.filters, l.created_at,
+              l.assigned_to, l.assigned_at, a.name AS assigned_to_name
+         FROM lead_lists l
+         LEFT JOIN users a ON a.id = l.assigned_to
+        WHERE l.id = $1 AND l.org_id = $2`,
       [id, req.orgId]
     );
-    if (!rows.length) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
+    if (!rows.length || !maaSe(req, rows[0])) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
 
     const stats = await db.query(
       `SELECT status, COUNT(*)::int AS count FROM leads
@@ -277,10 +365,21 @@ router.get('/lists/:id', authenticate, async (req, res) => {
   }
 });
 
-// ── PATCH /api/lists/:id — rename / archive ──────────────────────────────────
+// ── PATCH /api/lists/:id — omdøb, arkivér eller send til en medarbejder ─────
+//
+// assignedTo: en kollegas id, eller null for at tage listen tilbage. Kun ejeren.
+// Når en liste sendes ud, følger alle dens åbne virksomheder med — også dem
+// der før var tildelt en anden. Det er dét, "send listen til Sofie" betyder.
+// Tages den tilbage, frigives de åbne virksomheder, der lå hos den tidligere
+// medarbejder. Afsluttede leads beholder den, der afsluttede dem.
 router.patch('/lists/:id', authenticate, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Ugyldigt liste-id.' });
+
+  const tildeling = req.body?.assignedTo !== undefined;
+  if (tildeling && req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Kun ejeren kan sende lister ud.' });
+  }
 
   const sets = [];
   const params = [];
@@ -296,18 +395,55 @@ router.patch('/lists/:id', authenticate, async (req, res) => {
   if (req.body?.archived !== undefined) {
     sets.push(`archived_at = ${req.body.archived ? 'NOW()' : 'NULL'}`);
   }
-  if (!sets.length) return res.status(400).json({ error: 'Ingen ændringer angivet.' });
+  if (!sets.length && !tildeling) return res.status(400).json({ error: 'Ingen ændringer angivet.' });
 
-  params.push(id, req.orgId);
   try {
-    const { rows } = await db.query(
-      `UPDATE lead_lists SET ${sets.join(', ')}
-        WHERE id = $${params.length - 1} AND org_id = $${params.length}
-        RETURNING id, name, description, archived_at`,
-      params
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
-    return res.json({ list: rows[0] });
+    const før = await hentListe(req, id, 'id, name');
+    if (!før) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
+
+    let modtager = null;
+    if (tildeling && req.body.assignedTo !== null) {
+      modtager = await findModtager(req, req.body.assignedTo);
+      if (!modtager) return res.status(400).json({ error: 'Medarbejderen findes ikke eller er deaktiveret.' });
+    }
+    if (tildeling) {
+      params.push(modtager?.id ?? null);
+      sets.push(`assigned_to = $${params.length}`,
+                `assigned_at = CASE WHEN $${params.length}::int IS NULL THEN NULL ELSE NOW() END`);
+    }
+
+    const { liste, flyttet } = await db.transaction(async (client) => {
+      const { rows } = await client.query(
+        `UPDATE lead_lists SET ${sets.join(', ')}
+          WHERE id = $${params.length + 1} AND org_id = $${params.length + 2}
+          RETURNING id, name, description, archived_at, assigned_to, assigned_at`,
+        [...params, id, req.orgId]
+      );
+      let antal = 0;
+      if (tildeling && modtager) {
+        ({ rowCount: antal } = await client.query(
+          `UPDATE leads SET assigned_to = $1, updated_at = NOW()
+            WHERE list_id = $2 AND org_id = $3 AND status <> ALL($4::text[])`,
+          [modtager.id, id, req.orgId, TERMINAL_STATUSES]));
+      } else if (tildeling && før.assigned_to != null) {
+        await client.query(
+          `UPDATE leads SET assigned_to = NULL, updated_at = NOW()
+            WHERE list_id = $1 AND org_id = $2 AND assigned_to = $3
+              AND status <> ALL($4::text[])`,
+          [id, req.orgId, før.assigned_to, TERMINAL_STATUSES]);
+      }
+      return { liste: rows[0], flyttet: antal };
+    });
+
+    // Besked kun når listen skifter hænder, ikke ved et navneskifte.
+    const nyModtager = tildeling && modtager && modtager.id !== før.assigned_to;
+    const mailSendt = nyModtager ? await giBesked(req, modtager, liste, flyttet) : false;
+
+    return res.json({
+      list: { ...liste, assigned_to_name: modtager?.name ?? null },
+      tildelteLeads: flyttet,
+      mailSendt,
+    });
   } catch (err) {
     console.error('[lists:patch]', err.message);
     return res.status(500).json({ error: 'Kunne ikke opdatere listen.' });
@@ -319,6 +455,7 @@ router.delete('/lists/:id', authenticate, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Ugyldigt liste-id.' });
   try {
+    if (!(await hentListe(req, id))) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
     const { rowCount } = await db.query(
       'DELETE FROM lead_lists WHERE id = $1 AND org_id = $2', [id, req.orgId]
     );
@@ -378,10 +515,7 @@ router.delete('/lists/:id/leads', authenticate, async (req, res) => {
     // "intet matchede filteret" og "du peger på en liste der ikke er din".
     // Svaret er det samme i begge tilfælde — findes ikke og er ikke din skal
     // ikke kunne skelnes udefra.
-    const { rowCount: findes } = await db.query(
-      'SELECT 1 FROM lead_lists WHERE id = $1 AND org_id = $2', [listId, req.orgId]
-    );
-    if (!findes) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
+    if (!(await hentListe(req, listId))) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
 
     const { rowCount } = await db.query(
       `DELETE FROM leads WHERE ${where.join(' AND ')}`, params
@@ -417,6 +551,7 @@ router.get('/lists/:id/leads', authenticate, async (req, res) => {
   }
 
   try {
+    if (!(await hentListe(req, id))) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
     const countRes = await db.query(
       `SELECT COUNT(*)::int AS total FROM leads l WHERE ${where.join(' AND ')}`, params
     );
@@ -450,10 +585,8 @@ router.get('/lists/:id/export.csv', authenticate, async (req, res) => {
   }
 
   try {
-    const listRes = await db.query(
-      'SELECT name FROM lead_lists WHERE id = $1 AND org_id = $2', [id, req.orgId]
-    );
-    if (!listRes.rows.length) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
+    const listeRække = await hentListe(req, id);
+    if (!listeRække) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
 
     const { rows } = await db.query(
       `SELECT l.cvr, l.name, l.address, l.zipcode, l.city, l.municipality, l.phone,
@@ -482,7 +615,7 @@ router.get('/lists/:id/export.csv', authenticate, async (req, res) => {
       ['latest_note', 'Seneste note'],
     ]);
 
-    const safeName = listRes.rows[0].name.replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 60);
+    const safeName = listeRække.name.replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 60);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition',
       `attachment; filename="lysmera_${safeName}.csv"; filename*=UTF-8''lysmera_${encodeURIComponent(safeName)}.csv`);
@@ -509,10 +642,8 @@ router.post('/lists/:id/leads', authenticate, async (req, res) => {
     if (!numre.length) return res.status(400).json({ error: 'Ingen gyldige CVR-numre.' });
 
     try {
-      const liste = await db.query(
-        'SELECT id, name FROM lead_lists WHERE id = $1 AND org_id = $2', [id, req.orgId]
-      );
-      if (!liste.rows.length) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
+      const liste = await hentListe(req, id);
+      if (!liste) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
 
       const fundne = await cvr.lookupCompanies(numre);
       const beskyttede = fundne.filter((c) => c.advertisingProtected);
@@ -527,7 +658,7 @@ router.post('/lists/:id/leads', authenticate, async (req, res) => {
       }
 
       return res.status(201).json({
-        list: liste.rows[0],
+        list: { id: liste.id, name: liste.name },
         // Fire tal frem for ét, fordi forskellen mellem dem er det brugeren
         // spørger om når listen ikke voksede så meget som forventet.
         tilføjet: indsat,
@@ -546,10 +677,8 @@ router.post('/lists/:id/leads', authenticate, async (req, res) => {
   }
 
   try {
-    const liste = await db.query(
-      'SELECT id, name FROM lead_lists WHERE id = $1 AND org_id = $2', [id, req.orgId]
-    );
-    if (!liste.rows.length) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
+    const liste = await hentListe(req, id);
+    if (!liste) return res.status(404).json({ error: 'Listen blev ikke fundet.' });
 
     // Virksomheden hentes fra registret, ikke fra det klienten sender. Ellers
     // kunne hvad som helst lægges i en liste og se ud som CVR-data bagefter.
@@ -583,7 +712,7 @@ router.post('/lists/:id/leads', authenticate, async (req, res) => {
       added: indsat > 0,
       alreadyOnList: indsat === 0,
       company: { cvr: firma.cvr, name: firma.name },
-      list: liste.rows[0],
+      list: { id: liste.id, name: liste.name },
     });
   } catch (err) {
     return handleCvrError(err, res, 'lists:addLead');

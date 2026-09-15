@@ -15,6 +15,9 @@ const TRIAL_DAGE = Number(process.env.STRIPE_TRIAL_DAYS || 14);
 /** Grundprisen dækker ejeren. Kun medlem nummer to og opefter koster. */
 const PLADSER_INKLUDERET = 1;
 
+/** Flest ekstra pladser der kan købes ad gangen. Et værn mod tastefejl, ikke en forretningsregel. */
+const MAKS_PLADSER = Math.max(1, Number(process.env.MAX_SEATS || 50));
+
 // Klienten instantieres — den globale nøglestil (Stripe.setApiKey) er udgået.
 const stripe = SECRET
   ? new Stripe(SECRET, { apiVersion: '2026-07-29.dahlia' })
@@ -67,13 +70,18 @@ async function sikrKunde({ kundeId, orgNavn, cvr, email }) {
  * Stripe selv de betalingsmetoder der er slået til i dashboardet og som passer
  * til kunden — herunder MobilePay. Hardkodes den til kort, lukkes resten ude.
  */
-async function opretCheckout({ orgId, email, kundeId, orgNavn, cvr, successUrl, cancelUrl }) {
+async function opretCheckout({ orgId, email, kundeId, orgNavn, cvr, pladser = 0, successUrl, cancelUrl }) {
   // Kunden oprettes på forhånd, så navnet er virksomhedens fra første faktura.
   const kunde = await sikrKunde({ kundeId, orgNavn, cvr, email });
 
   return stripe.checkout.sessions.create({
     mode: 'subscription',
-    line_items: [{ price: PRICE_ID, quantity: 1 }],
+    // Grundabonnementet plus de ekstra pladser, kunden valgte ved oprettelsen.
+    // Stripe tillader ikke en linje med antal 0, så den udelades i stedet.
+    line_items: [
+      { price: PRICE_ID, quantity: 1 },
+      ...(pladser > 0 ? [{ price: SEAT_PRICE_ID, quantity: pladser }] : []),
+    ],
 
     customer: kunde,
 
@@ -106,20 +114,23 @@ async function opretCheckout({ orgId, email, kundeId, orgNavn, cvr, successUrl, 
 }
 
 /**
- * Sæt antallet af betalte pladser på et abonnement.
+ * Sæt antallet af købte ekstra pladser på et abonnement.
  *
- * Antallet regnes ud fra hvor mange aktive brugere organisationen HAR — ikke
- * ved at tælle op og ned ved hver ændring. Det betyder at en enkelt fejlet
- * synkronisering retter sig selv ved næste ændring, i stedet for at drive
- * længere og længere fra virkeligheden.
+ * Pladserne er forudbetalte: kunden vælger antallet, og det står fast, indtil
+ * kunden selv ændrer det, uanset hvor mange der er inviteret. Tallet er det
+ * ønskede samlede antal, ikke en ændring, så et gentaget kald efter en fejl
+ * ikke kan tælle dobbelt.
  *
- * `proration_behavior: 'none'`: nye medlemmer betales først fra næste faktura.
- * Uden den ville Stripe opkræve for de resterende dage med det samme.
+ * `proration_behavior: 'none'`: en ny plads betales fra næste faktura, og en
+ * opsagt plads refunderes ikke for resten af perioden.
  */
-async function synkroniserPladser({ abonnementId, aktiveBrugere }) {
-  if (!stripe || !SEAT_PRICE_ID || !abonnementId) return null;
+async function saetPladser({ abonnementId, pladser }) {
+  if (!stripe || !SEAT_PRICE_ID || !abonnementId) {
+    const fejl = new Error('Ekstra pladser kan ikke købes: betalingen er ikke sat op.');
+    fejl.code = 'SEATS_NOT_CONFIGURED';
+    throw fejl;
+  }
 
-  const pladser = Math.max(0, aktiveBrugere - PLADSER_INKLUDERET);
   const sub = await stripe.subscriptions.retrieve(abonnementId);
   const linje = sub.items.data.find((i) => i.price?.id === SEAT_PRICE_ID);
 
@@ -145,6 +156,16 @@ async function synkroniserPladser({ abonnementId, aktiveBrugere }) {
     });
   }
   return { pladser };
+}
+
+/**
+ * Antal ekstra pladser på et abonnement, som Stripe ser det. null, hvis der
+ * ingen pladspris er sat op, så tallet i databasen ikke overskrives med 0.
+ */
+function pladserFraAbonnement(sub) {
+  if (!SEAT_PRICE_ID) return null;
+  const linje = sub?.items?.data?.find((i) => i.price?.id === SEAT_PRICE_ID);
+  return linje ? linje.quantity : 0;
 }
 
 /** Kundeportalen: skift kort, se kvitteringer, opsig. */
@@ -190,10 +211,12 @@ module.exports = {
   opretCheckout,
   opretPortal,
   opsigStraks,
-  synkroniserPladser,
+  saetPladser,
+  pladserFraAbonnement,
   verificerWebhook,
   PRICE_ID,
   SEAT_PRICE_ID,
   TRIAL_DAGE,
   PLADSER_INKLUDERET,
+  MAKS_PLADSER,
 };

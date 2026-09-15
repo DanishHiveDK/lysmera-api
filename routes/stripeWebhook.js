@@ -45,25 +45,32 @@ async function gemAbonnement(sub) {
   const orgId = Number(sub.metadata?.org_id) || null;
   const kundeId = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
 
+  // Ekstra pladser læses af selve abonnementet. Stripe er kilden: ændres
+  // antallet i dashboardet, følger databasen med herfra.
+  const pladser = stripeService.pladserFraAbonnement(sub);
+
   const felter = [
     sub.status,
     tid(periodeSlut(sub)),
     sub.id,
     kundeId,
+    pladser,
   ];
 
   const { rowCount } = orgId
     ? await db.query(
         `UPDATE organizations
             SET subscription_status = $1, current_period_end = $2,
-                stripe_subscription_id = $3, stripe_customer_id = $4
-          WHERE id = $5`,
+                stripe_subscription_id = $3, stripe_customer_id = $4,
+                paid_seats = COALESCE($5::int, paid_seats)
+          WHERE id = $6`,
         [...felter, orgId]
       )
     : await db.query(
         `UPDATE organizations
             SET subscription_status = $1, current_period_end = $2,
-                stripe_subscription_id = $3
+                stripe_subscription_id = $3,
+                paid_seats = COALESCE($5::int, paid_seats)
           WHERE stripe_customer_id = $4`,
         felter
       );

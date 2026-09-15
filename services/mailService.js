@@ -1,4 +1,4 @@
-// services/mailService.js — udgående post. Lige nu kun teaminvitationer.
+// services/mailService.js — udgående post: teaminvitationer og tildelte ringelister.
 //
 // Der er ingen mailudbyder i afhængighederne: Resends HTTP-API er ét kald, og
 // et bibliotek til det ville være en afhængighed mere at holde opdateret.
@@ -78,4 +78,32 @@ async function sendInvitation({ til, navn, orgNavn, inviteretAf, link }) {
   });
 }
 
-module.exports = { erKonfigureret, sendInvitation };
+/**
+ * En ringeliste er sendt til en medarbejder. Som invitationen er mailen en
+ * genvej: listen står på medarbejderens egen listeside, uanset om mailen når frem.
+ */
+async function sendListeTildelt({ til, navn, listeNavn, antal, tildeltAf, link }) {
+  const hilsen = navn ? `Hej ${navn}` : 'Hej';
+  const fra = tildeltAf || 'En kollega';
+  const leads = `${antal} ${antal === 1 ? 'virksomhed' : 'virksomheder'}`;
+
+  return send({
+    til,
+    emne: `Ny ringeliste til dig: ${listeNavn}`,
+    tekst:
+      `${hilsen}\n\n${fra} har sendt ringelisten "${listeNavn}" til dig med ${leads} at ringe til.\n\n` +
+      `Åbn listen: ${link}\n`,
+    html:
+      `<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:15px;line-height:1.6;color:#111">
+         <p>${esc(hilsen)}</p>
+         <p><strong>${esc(fra)}</strong> har sendt ringelisten <strong>${esc(listeNavn)}</strong>
+            til dig med ${esc(leads)} at ringe til.</p>
+         <p><a href="${esc(link)}" style="display:inline-block;background:#111;color:#fff;
+               padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:600">
+            Åbn listen</a></p>
+         <p style="color:#555;font-size:13px">Listen ligger også under Lister, når du logger ind.</p>
+       </div>`,
+  });
+}
+
+module.exports = { erKonfigureret, sendInvitation, sendListeTildelt };

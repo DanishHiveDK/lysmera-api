@@ -5,6 +5,7 @@ const express  = require('express');
 const crypto   = require('crypto');
 const bcrypt   = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
+const { TERMINAL_STATUSES } = require('../config/cvrOptions');
 const db       = require('../db');
 const appUrl   = require('../config/appUrl');
 const cvrService = require('../services/cvrService');
@@ -151,6 +152,13 @@ router.post('/register', registerLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Adgangskoden skal være mindst 10 tegn.' });
   }
 
+  // Ekstra brugere valgt ved oprettelsen. De betales først, når abonnementet
+  // tegnes; indtil da er tallet et ønske, som checkout tager med.
+  const pladser = Number(req.body?.pladser ?? 0);
+  if (!Number.isInteger(pladser) || pladser < 0 || pladser > stripeService.MAKS_PLADSER) {
+    return res.status(400).json({ error: `Vælg mellem 0 og ${stripeService.MAKS_PLADSER} ekstra brugere.` });
+  }
+
   // Slå nummeret op før der oprettes noget. Findes virksomheden ikke, er
   // nøglen til "én prøveperiode per virksomhed" værdiløs.
   let firma;
@@ -182,8 +190,8 @@ router.post('/register', registerLimiter, async (req, res) => {
       // Navnet tages fra registret, ikke fra brugeren. Det er både mere
       // korrekt og ét felt mindre at udfylde.
       const org = await client.query(
-        'INSERT INTO organizations (name, cvr) VALUES ($1, $2) RETURNING id, name',
-        [firma.name, cvr]
+        'INSERT INTO organizations (name, cvr, requested_seats) VALUES ($1, $2, $3) RETURNING id, name',
+        [firma.name, cvr, pladser]
       );
       const created = await client.query(
         `INSERT INTO users (org_id, email, password_hash, name, role)
@@ -280,10 +288,18 @@ router.patch('/me', authenticate, async (req, res) => {
 // ── GET /api/auth/team — colleagues, for the "assigned to" pickers ───────────
 router.get('/team', authenticate, async (req, res) => {
   try {
+    // Lister og åbne leads pr. medarbejder: ejerens overblik over, hvem der
+    // har hvilke ringelister.
     const { rows } = await db.query(
-      `SELECT id, name, email, role, is_active, last_login_at
-         FROM users WHERE org_id = $1 ORDER BY name`,
-      [req.orgId]
+      `SELECT u.id, u.name, u.email, u.role, u.is_active, u.last_login_at,
+              (SELECT COUNT(*)::int FROM lead_lists ll
+                WHERE ll.org_id = u.org_id AND ll.assigned_to = u.id
+                  AND ll.archived_at IS NULL)                  AS lister,
+              (SELECT COUNT(*)::int FROM leads l
+                WHERE l.org_id = u.org_id AND l.assigned_to = u.id
+                  AND l.status <> ALL($2::text[]))             AS aabne_leads
+         FROM users u WHERE u.org_id = $1 ORDER BY u.name`,
+      [req.orgId, TERMINAL_STATUSES]
     );
     return res.json({ users: rows });
   } catch (err) {
@@ -293,11 +309,13 @@ router.get('/team', authenticate, async (req, res) => {
 });
 
 /**
- * Pladserne på en konto: hvor mange der er brugt, og om der er flere tilbage.
+ * Pladserne på en konto: hvor mange der er, hvor mange der er brugt, og om
+ * der er flere tilbage.
  *
- * Kun fritagne konti har et loft. En betalende konto må have alle de kollegaer
- * den vil — de koster hver især en plads på fakturaen, og dét er bremsen.
- * En fritagen konto har ingen faktura at bremse med, så loftet er tallet her.
+ * Pladserne er forudbetalte. En konto har ejerens plads plus de ekstra
+ * pladser, der er købt i Stripe, eller, før abonnementet er tegnet, dem der
+ * blev valgt ved oprettelsen. En fritagen konto har i stedet de gratis
+ * teampladser.
  *
  * Afventende invitationer tæller med. Ellers kunne ejeren invitere tyve og
  * først opdage loftet når den sjette sagde ja — og så ville de fjorten andre
@@ -306,42 +324,54 @@ router.get('/team', authenticate, async (req, res) => {
 async function pladsOverblik(orgId) {
   const { rows } = await db.query(
     `SELECT (SELECT u.email FROM users u
-              WHERE u.org_id = $1 AND u.role = 'owner'
+              WHERE u.org_id = o.id AND u.role = 'owner'
               ORDER BY u.id LIMIT 1)                              AS ejer_email,
             (SELECT COUNT(*)::int FROM users u
-              WHERE u.org_id = $1 AND u.is_active)                AS aktive,
+              WHERE u.org_id = o.id AND u.is_active)              AS aktive,
             (SELECT COUNT(*)::int FROM team_invitations i
-              WHERE i.org_id = $1 AND i.status = 'pending'
-                AND i.expires_at > NOW())                         AS afventende`,
+              WHERE i.org_id = o.id AND i.status = 'pending'
+                AND i.expires_at > NOW())                         AS afventende,
+            o.paid_seats, o.requested_seats, o.stripe_subscription_id AS abonnement
+       FROM organizations o WHERE o.id = $1`,
     [orgId]
   );
-  const r = rows[0] ?? { aktive: 0, afventende: 0 };
+  const r = rows[0] ?? { aktive: 0, afventende: 0, paid_seats: 0, requested_seats: 0, abonnement: null };
   const fri = erFritaget(r.ejer_email);
-  // Ejeren selv plus de gratis teampladser.
-  const loft = fri ? 1 + GRATIS_TEAMPLADSER : null;
+  const koebte = fri ? 0 : (r.abonnement ? r.paid_seats : r.requested_seats);
+  const loft = fri
+    ? 1 + GRATIS_TEAMPLADSER
+    : stripeService.PLADSER_INKLUDERET + koebte;
   const brugt = r.aktive + r.afventende;
 
   return {
     fri,
     loft,
+    koebte,
     gratisPladser: fri ? GRATIS_TEAMPLADSER : 0,
     aktive: r.aktive,
     afventende: r.afventende,
-    ledige: loft === null ? null : Math.max(0, loft - brugt),
+    brugt,
+    ledige: Math.max(0, loft - brugt),
   };
 }
 
 /** Er der plads til én mere? Svarer med den besked brugeren skal se. */
 async function afvisHvisFuldt(orgId) {
   const plads = await pladsOverblik(orgId);
-  if (plads.loft !== null && plads.ledige < 1) {
+  if (plads.ledige >= 1) return null;
+  if (plads.fri) {
     return {
       error: `Kontoen har ${plads.gratisPladser} gratis teampladser ud over dig selv, `
            + 'og de er brugt. Deaktivér et medlem eller træk en invitation tilbage først.',
       code: 'FREE_SEATS_EXCEEDED',
     };
   }
-  return null;
+  return {
+    error: `Alle ${plads.loft} pladser er i brug. Køb flere pladser under Medlemskab, `
+         + 'eller deaktivér et medlem eller træk en invitation tilbage.',
+    code: 'NO_SEATS',
+    plads,
+  };
 }
 
 // ── POST /api/auth/team — owner invites a colleague ──────────────────────────
@@ -369,8 +399,7 @@ router.post('/team', authenticate, requireOwner, async (req, res) => {
        RETURNING id, name, email, role, is_active`,
       [req.orgId, email, hash, name, role]
     );
-    const pladser = await opdaterPladser(req.orgId);
-    return res.status(201).json({ user: rows[0], seats: pladser });
+    return res.status(201).json({ user: rows[0], plads: await pladsOverblik(req.orgId) });
   } catch (err) {
     if (err.code === '23505') {
       return res.status(409).json({ error: 'Den e-mail er allerede i brug.' });
@@ -379,36 +408,6 @@ router.post('/team', authenticate, requireOwner, async (req, res) => {
     return res.status(500).json({ error: 'Kunne ikke oprette brugeren.' });
   }
 });
-
-/**
- * Sæt antallet af betalte pladser efter en ændring i teamet.
- *
- * Fejler kaldet til Stripe, oprettes brugeren alligevel. Det betyder at I i
- * værste fald opkræver for lidt indtil næste ændring — og det er den rigtige
- * vej at fejle: en kunde der ikke kan tilføje sin kollega fordi Stripe har en
- * dårlig dag, er værre end en faktura der mangler 99 kroner i en periode.
- * Fordi antallet regnes ud på ny hver gang, retter det sig selv.
- */
-async function opdaterPladser(orgId) {
-  try {
-    const { rows } = await db.query(
-      `SELECT o.stripe_subscription_id AS sub,
-              (SELECT COUNT(*)::int FROM users u
-                WHERE u.org_id = o.id AND u.is_active) AS aktive
-         FROM organizations o WHERE o.id = $1`,
-      [orgId]
-    );
-    const org = rows[0];
-    if (!org?.sub) return null;   // Ingen abonnement endnu — intet at opdatere.
-    return await stripeService.synkroniserPladser({
-      abonnementId: org.sub,
-      aktiveBrugere: org.aktive,
-    });
-  } catch (err) {
-    console.error('[auth:team:pladser]', err.message);
-    return null;
-  }
-}
 
 // ── PATCH /api/auth/team/:id — et medlems profil og adgang ───────────────────
 //
@@ -492,8 +491,7 @@ router.patch('/team/:id', authenticate, requireOwner, async (req, res) => {
         RETURNING id, name, email, role, is_active`,
       [...kolonner.map((k) => sæt[k]), id, req.orgId]
     );
-    const pladser = await opdaterPladser(req.orgId);
-    return res.json({ user: rows[0], seats: pladser });
+    return res.json({ user: rows[0], plads: await pladsOverblik(req.orgId) });
   } catch (err) {
     if (err.code === '23505') {
       return res.status(409).json({ error: 'Den e-mail er allerede i brug.' });
@@ -744,11 +742,6 @@ router.post('/invitations/:id/accept', authenticate, async (req, res) => {
       return opdateret.rows[0];
     });
 
-    // Pladserne på begge konti kan have ændret sig. Fejler det, retter det sig
-    // ved næste ændring — se opdaterPladser.
-    await opdaterPladser(inv.org_id);
-    if (!sidsteMand) await opdaterPladser(gammelOrgId);
-
     // Nyt token: det gamle er stadig gyldigt (login læses fra databasen ved
     // hvert kald), men bærer den gamle org i sin nyttelast.
     return res.json({
@@ -881,7 +874,6 @@ router.post('/invite/:token', invitationLimiter, async (req, res) => {
       return oprettet.rows[0];
     });
 
-    await opdaterPladser(inv.org_id);
 
     return res.status(201).json({
       token: signToken(bruger),
