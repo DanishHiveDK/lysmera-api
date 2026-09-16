@@ -13,6 +13,12 @@
 const NØGLE = process.env.RESEND_API_KEY || '';
 const FRA   = process.env.MAIL_FROM || 'Lysmera <ingen-svar@lysmera.dk>';
 
+// Svar på kontaktbeskeder kommer fra en rigtig postkasse, så kundens svar
+// lander et sted, hvor nogen læser det — ikke på ingen-svar@.
+const SVAR_FRA    = process.env.MAIL_SVAR_FROM || 'Lucca fra Lysmera <lucca@lysmera.dk>';
+const SVAR_TIL    = process.env.MAIL_SVAR_REPLY_TO || 'lucca@lysmera.dk';
+const KONTAKT_TIL = process.env.KONTAKT_MODTAGER || 'lucca@look-a.dk';
+
 function erKonfigureret() {
   return Boolean(NØGLE);
 }
@@ -24,7 +30,7 @@ function esc(s) {
   ));
 }
 
-async function send({ til, emne, html, tekst }) {
+async function send({ til, emne, html, tekst, fra = FRA, svarTil }) {
   if (!erKonfigureret()) return false;
   try {
     const res = await fetch('https://api.resend.com/emails', {
@@ -33,7 +39,10 @@ async function send({ til, emne, html, tekst }) {
         Authorization: `Bearer ${NØGLE}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ from: FRA, to: [til], subject: emne, html, text: tekst }),
+      body: JSON.stringify({
+        from: fra, to: [til], subject: emne, html, text: tekst,
+        ...(svarTil ? { reply_to: svarTil } : {}),
+      }),
       // Uden en grænse kan en langsom mailudbyder holde HTTP-svaret til ejeren
       // tilbage. Invitationen er allerede oprettet på det tidspunkt.
       signal: AbortSignal.timeout(8000),
@@ -106,4 +115,49 @@ async function sendListeTildelt({ til, navn, listeNavn, antal, tildeltAf, link }
   });
 }
 
-module.exports = { erKonfigureret, sendInvitation, sendListeTildelt };
+/**
+ * Ny besked fra kontaktformularen. Beskeden står i admin; mailen er en
+ * genvej, og trykker man svar i mailprogrammet, går det til den, der skrev.
+ */
+async function sendKontaktNotifikation({ navn, epost, besked, link }) {
+  return send({
+    til: KONTAKT_TIL,
+    svarTil: epost,
+    emne: `Ny besked på lysmera.dk — ${navn}`,
+    tekst:
+      `${navn} <${epost}> skrev:\n\n${besked || '(ingen tekst)'}\n\n` +
+      `Svar fra admin: ${link}\n`,
+    html:
+      `<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:15px;line-height:1.6;color:#111">
+         <p><strong>${esc(navn)}</strong> &lt;${esc(epost)}&gt; skrev:</p>
+         <p style="white-space:pre-wrap;border-left:3px solid #7c3aed;padding-left:12px">${esc(besked || '(ingen tekst)')}</p>
+         <p><a href="${esc(link)}" style="display:inline-block;background:#111;color:#fff;
+               padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:600">
+            Svar fra admin</a></p>
+       </div>`,
+  });
+}
+
+/** Svar på en kontaktbesked, sendt som Lysmera med den oprindelige besked citeret. */
+async function sendKontaktSvar({ til, navn, emne, tekst, oprindelig, dato }) {
+  const citat = oprindelig
+    ? `\n\n${navn} skrev ${dato}:\n` + oprindelig.split('\n').map((l) => `> ${l}`).join('\n')
+    : '';
+  return send({
+    til,
+    fra: SVAR_FRA,
+    svarTil: SVAR_TIL,
+    emne,
+    tekst: `${tekst}${citat}\n`,
+    html:
+      `<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:15px;line-height:1.6;color:#111">
+         <p style="white-space:pre-wrap">${esc(tekst)}</p>
+         ${oprindelig ? `<p style="color:#555;font-size:13px;margin-top:24px">${esc(navn)} skrev ${esc(dato)}:</p>
+         <blockquote style="white-space:pre-wrap;color:#555;font-size:13px;border-left:3px solid #ddd;margin:0;padding-left:12px">${esc(oprindelig)}</blockquote>` : ''}
+       </div>`,
+  });
+}
+
+module.exports = {
+  erKonfigureret, sendInvitation, sendListeTildelt, sendKontaktNotifikation, sendKontaktSvar,
+};

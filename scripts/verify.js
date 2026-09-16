@@ -107,6 +107,7 @@ async function main() {
   // loftet skal kunne rammes uden at oprette et helt team først.
   process.env.BILLING_EXEMPT_EMAILS = 'fri@example.dk';
   process.env.FREE_TEAM_SEATS       = '2';
+  process.env.PLATFORM_ADMIN_EMAILS = 'admin@example.dk';
 
   const db = require('../db');
 
@@ -918,6 +919,81 @@ async function main() {
       'SELECT assigned_to FROM leads WHERE list_id = $1 AND cvr = $2', [kampagneId, '55555555']);
     check('nye virksomheder i listen får listens medarbejder',
       arvet.rows[0]?.assigned_to === mariaId, JSON.stringify(nyVirksomhed.json));
+
+    // ── Kontaktformular og beskeder i admin ──────────────────────────────────
+    section('Kontaktbeskeder');
+    // Tokenet laves direkte: loginbremsen er brugt op af afsnittene ovenfor.
+    const platform = await mkOrg('Platform', 'admin@example.dk');
+    const adminToken = require('../middleware/auth').signToken({
+      id: platform.userId, org_id: platform.orgId, email: 'admin@example.dk', role: 'owner', name: 'Admin' });
+
+    const kontakt = (body, ip = '10.0.0.1') => fetch(`${BASE}/api/kontakt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Klient-IP': ip },
+      body: JSON.stringify(body),
+    }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }));
+
+    const ny = await kontakt({ navn: 'Kunde Karl', epost: 'Karl@Kunde.dk', hvem: 'Tømrere på Fyn\nlinje to' });
+    check('kontaktformularen kræver ikke login og gemmer beskeden', ny.status === 201, JSON.stringify(ny.json));
+    check('ugyldig e-mail afvises',
+      (await kontakt({ navn: 'X', epost: 'ikke-en-mail' })).json?.fejl === 'ugyldig_epost');
+    check('manglende navn afvises',
+      (await kontakt({ navn: '', epost: 'a@b.dk' })).json?.fejl === 'mangler_felter');
+    const robot = await kontakt({ navn: 'Bot', epost: 'bot@spam.dk', hjemmeside: 'http://spam' });
+    const robotRækker = await db.query(`SELECT COUNT(*)::int AS n FROM kontakt_beskeder WHERE navn = 'Bot'`);
+    check('honeypot: robotten får ok, men intet gemmes', robot.status === 200 && robotRækker.rows[0].n === 0);
+    let sidste;
+    for (let i = 0; i < 6; i++) sidste = await kontakt({ navn: 'Flood', epost: 'f@f.dk' }, '10.0.0.9');
+    check('for mange beskeder fra samme adresse bremses', sidste.status === 429);
+
+    const kundeListe = await call('/api/admin/beskeder', { token: tokenA });
+    check('en almindelig kunde kan ikke se beskederne', kundeListe.status === 404);
+
+    const liste = await call('/api/admin/beskeder', { token: adminToken });
+    const karl = liste.json?.beskeder?.find((b) => b.navn === 'Kunde Karl');
+    check('admin ser beskeden med tekst og små bogstaver i e-mail',
+      karl?.epost === 'karl@kunde.dk' && karl?.besked === 'Tømrere på Fyn\nlinje to', JSON.stringify(karl));
+    check('den tæller som ulæst', liste.json?.ulaeste >= 1 && karl?.laest_at === null);
+
+    const åbnet = await call(`/api/admin/beskeder/${karl.id}`, { token: adminToken });
+    check('at åbne beskeden markerer den som læst', åbnet.json?.besked?.laest_at != null);
+
+    const utenMail = await call(`/api/admin/beskeder/${karl.id}/svar`, {
+      method: 'POST', token: adminToken, body: { tekst: 'Hej Karl' } });
+    check('uden mailudbyder siges det tydeligt', utenMail.status === 503 && utenMail.json.code === 'MAIL_IKKE_OPSAT');
+
+    const mailSvc = require('../services/mailService');
+    const ægte = { k: mailSvc.erKonfigureret, s: mailSvc.sendKontaktSvar };
+    const sendte = [];
+    mailSvc.erKonfigureret = () => true;
+    mailSvc.sendKontaktSvar = async (m) => { sendte.push(m); return true; };
+    const svaret = await call(`/api/admin/beskeder/${karl.id}/svar`, {
+      method: 'POST', token: adminToken, body: { tekst: 'Hej Karl, velkommen.' } });
+    check('svaret sendes til kundens adresse med den oprindelige besked',
+      svaret.status === 201 && sendte[0]?.til === 'karl@kunde.dk' && sendte[0]?.oprindelig.startsWith('Tømrere'),
+      JSON.stringify(svaret.json));
+    mailSvc.sendKontaktSvar = async () => false;
+    const fejlet = await call(`/api/admin/beskeder/${karl.id}/svar`, {
+      method: 'POST', token: adminToken, body: { tekst: 'Andet forsøg' } });
+    check('en fejlet mail giver 502, men svaret gemmes som ikke sendt',
+      fejlet.status === 502 && fejlet.json?.svar?.sendt === false);
+    Object.assign(mailSvc, { erKonfigureret: ægte.k, sendKontaktSvar: ægte.s });
+
+    const tråd = await call(`/api/admin/beskeder/${karl.id}`, { token: adminToken });
+    check('tråden viser begge svar i rækkefølge',
+      tråd.json?.svar?.length === 2 && tråd.json.svar[0].sendt && !tråd.json.svar[1].sendt);
+    const listeEfter = await call('/api/admin/beskeder', { token: adminToken });
+    check('kun sendte svar tælles i oversigten',
+      listeEfter.json.beskeder.find((b) => b.id === karl.id)?.svar === 1);
+
+    await call(`/api/admin/beskeder/${karl.id}`, {
+      method: 'PATCH', token: adminToken, body: { arkiveret: true } });
+    const aktive = await call('/api/admin/beskeder', { token: adminToken });
+    const arkiv = await call('/api/admin/beskeder?arkiv=1', { token: adminToken });
+    check('en arkiveret besked flytter til arkivet',
+      !aktive.json.beskeder.some((b) => b.id === karl.id) && arkiv.json.beskeder.some((b) => b.id === karl.id));
+    check('beskeder med skæve id\'er giver 404',
+      (await call('/api/admin/beskeder/1%3B', { token: adminToken })).status === 404);
 
     section('Sletning');
     await call(`/api/lists/${listId}`, { method: 'DELETE', token: tokenA });
