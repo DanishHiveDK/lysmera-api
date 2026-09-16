@@ -194,7 +194,7 @@ router.post('/beskeder/:id/svar', async (req, res) => {
   if (!tekst) return res.status(400).json({ error: 'Skriv et svar først.' });
   if (!mailService.erKonfigureret()) {
     return res.status(503).json({
-      error: 'Mail er ikke sat op på serveren (RESEND_API_KEY mangler).',
+      error: 'Mail er ikke sat op på serveren (SMTP_USER/SMTP_PASS eller RESEND_API_KEY mangler).',
       code: 'MAIL_IKKE_OPSAT',
     });
   }

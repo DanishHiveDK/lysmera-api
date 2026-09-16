@@ -1,7 +1,13 @@
 // services/mailService.js — udgående post: teaminvitationer og tildelte ringelister.
 //
-// Der er ingen mailudbyder i afhængighederne: Resends HTTP-API er ét kald, og
-// et bibliotek til det ville være en afhængighed mere at holde opdateret.
+// To veje ud, valgt efter hvad der er sat op:
+//   - Google Workspace over SMTP (SMTP_USER + SMTP_PASS): postkassen
+//     lkk@eurohive.eu med et app-kodeord. Afsenderen skal være en adresse
+//     kontoen må sende som — lucca@lysmera.dk er en alternativ adresse på den.
+//     Gmail skriver ellers stille From om til kontoens egen adresse.
+//     Sendte mails ligger bagefter i postkassens "Sendt".
+//   - Resend (RESEND_API_KEY): ét HTTP-kald, intet bibliotek.
+// SMTP vinder, hvis begge er sat.
 //
 // Vigtigst: **mailen er ikke det der bærer invitationen**. Invitationen ligger
 // i databasen, og den inviterede kan se den på sit eget overblik og acceptere
@@ -10,8 +16,14 @@
 // gøre en glemt miljøvariabel til en funktion der ikke virker.
 'use strict';
 
-const NØGLE = process.env.RESEND_API_KEY || '';
-const FRA   = process.env.MAIL_FROM || 'Lysmera <ingen-svar@lysmera.dk>';
+const NØGLE     = process.env.RESEND_API_KEY || '';
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, ''); // Google viser koden i blokke
+const BRUG_SMTP = Boolean(SMTP_USER && SMTP_PASS);
+
+// Over Gmail findes ingen-svar@ ikke som adresse, så standarden er en, der gør.
+const FRA = process.env.MAIL_FROM
+  || (BRUG_SMTP ? 'Lysmera <lucca@lysmera.dk>' : 'Lysmera <ingen-svar@lysmera.dk>');
 
 // Svar på kontaktbeskeder kommer fra en rigtig postkasse, så kundens svar
 // lander et sted, hvor nogen læser det — ikke på ingen-svar@.
@@ -20,7 +32,24 @@ const SVAR_TIL    = process.env.MAIL_SVAR_REPLY_TO || 'lucca@lysmera.dk';
 const KONTAKT_TIL = process.env.KONTAKT_MODTAGER || 'lucca@look-a.dk';
 
 function erKonfigureret() {
-  return Boolean(NØGLE);
+  return BRUG_SMTP || Boolean(NØGLE);
+}
+
+let transport = null;
+function smtp() {
+  if (!transport) {
+    transport = require('nodemailer').createTransport({
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port: Number(process.env.SMTP_PORT || 465),
+      secure: Number(process.env.SMTP_PORT || 465) === 465,
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+      // Samme grund som timeouten på Resend-kaldet nedenfor.
+      connectionTimeout: 8000,
+      greetingTimeout: 8000,
+      socketTimeout: 15000,
+    });
+  }
+  return transport;
 }
 
 /** Undgå at fremmed tekst — et firmanavn med & eller < — brækker HTML'en. */
@@ -32,6 +61,18 @@ function esc(s) {
 
 async function send({ til, emne, html, tekst, fra = FRA, svarTil }) {
   if (!erKonfigureret()) return false;
+  if (BRUG_SMTP) {
+    try {
+      await smtp().sendMail({
+        from: fra, to: til, subject: emne, html, text: tekst,
+        ...(svarTil ? { replyTo: svarTil } : {}),
+      });
+      return true;
+    } catch (err) {
+      console.error('[mail] SMTP afviste:', err.responseCode ?? '', err.message);
+      return false;
+    }
+  }
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
