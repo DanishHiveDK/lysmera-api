@@ -114,6 +114,36 @@ router.get('/invoices', async (req, res) => {
   }
 });
 
+// ── GET /api/admin/guides ────────────────────────────────────────────────────
+// Hvor mange har åbnet hver guide. Vores egne konti tælles ikke med — ellers
+// ville vores egen korrekturlæsning se ud som interesse.
+router.get('/guides', async (req, res) => {
+  try {
+    // Tælles i koden: fritagelseslisten bor her, ikke i databasen.
+    const { rows: pr } = await db.query(
+      `SELECT g.slug, g.org_id, g.antal, g.sidste_at,
+              (SELECT u.email FROM users u WHERE u.org_id = g.org_id AND u.role = 'owner'
+                ORDER BY u.id LIMIT 1) AS ejer
+         FROM guide_visninger g`
+    );
+    const tal = {};
+    for (const r of pr) {
+      if (erFritaget(r.ejer)) continue;
+      const t = (tal[r.slug] ??= { slug: r.slug, laesere: 0, konti: new Set(), visninger: 0, sidst_laest: null });
+      t.laesere += 1;
+      t.konti.add(r.org_id);
+      t.visninger += r.antal;
+      if (!t.sidst_laest || r.sidste_at > t.sidst_laest) t.sidst_laest = r.sidste_at;
+    }
+    return res.json({
+      guides: Object.values(tal).map((t) => ({ ...t, konti: t.konti.size })),
+    });
+  } catch (err) {
+    console.error('[admin:guides]', err.message);
+    return res.status(500).json({ error: 'Kunne ikke hente guidetal.' });
+  }
+});
+
 // ── Beskeder fra kontaktformularen ───────────────────────────────────────────
 
 const ID = /^\d+$/;

@@ -995,6 +995,27 @@ async function main() {
     check('beskeder med skæve id\'er giver 404',
       (await call('/api/admin/beskeder/1%3B', { token: adminToken })).status === 404);
 
+    section('Guides');
+    const læs = (slug, token) => call(`/api/guides/${slug}/laest`, { method: 'POST', token });
+    check('en guide kræver login', (await læs('kom-i-gang')).status === 401);
+    check('åbning registreres', (await læs('kom-i-gang', tokenA)).status === 204);
+    await læs('kom-i-gang', tokenA);
+    await læs('kom-i-gang', tokenB);
+    await læs('regler', friToken); // fritaget konto: tæller ikke med
+    await læs('regler', friToken);
+    check('skæve navne afvises', (await læs('Ikke_OK', tokenA)).status === 404);
+    const gRække = await db.query(
+      `SELECT antal FROM guide_visninger g JOIN users u ON u.id = g.user_id
+        WHERE u.email = 'a@example.dk' AND slug = 'kom-i-gang'`);
+    check('gentagne åbninger tæller op på én række', gRække.rows[0]?.antal === 2);
+    check('en kunde kan ikke se guidetallene',
+      (await call('/api/admin/guides', { token: tokenA })).status === 404);
+    const gTal = (await call('/api/admin/guides', { token: adminToken })).json?.guides ?? [];
+    const kig = gTal.find((g) => g.slug === 'kom-i-gang');
+    check('admin ser læsere, konti og visninger',
+      kig?.laesere === 2 && kig?.konti === 2 && kig?.visninger === 3, JSON.stringify(kig));
+    check('fritagne konti tælles ikke med', !gTal.some((g) => g.slug === 'regler'), JSON.stringify(gTal));
+
     section('Sletning');
     await call(`/api/lists/${listId}`, { method: 'DELETE', token: tokenA });
     const orphans = await db.query('SELECT COUNT(*)::int AS n FROM leads WHERE list_id = $1', [listId]);
