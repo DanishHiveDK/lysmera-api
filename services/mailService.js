@@ -7,7 +7,8 @@
 //     Gmail skriver ellers stille From om til kontoens egen adresse.
 //     Sendte mails ligger bagefter i postkassens "Sendt".
 //   - Resend (RESEND_API_KEY): ét HTTP-kald, intet bibliotek.
-// SMTP vinder, hvis begge er sat.
+// Resend vinder, hvis begge er sat: Railway blokerer udgående SMTP på
+// Hobby-planen (forbindelsen timer bare ud), så SMTP virker kun andre steder.
 //
 // Vigtigst: **mailen er ikke det der bærer invitationen**. Invitationen ligger
 // i databasen, og den inviterede kan se den på sit eget overblik og acceptere
@@ -19,7 +20,7 @@
 const NØGLE     = process.env.RESEND_API_KEY || '';
 const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, ''); // Google viser koden i blokke
-const BRUG_SMTP = Boolean(SMTP_USER && SMTP_PASS);
+const BRUG_SMTP = Boolean(SMTP_USER && SMTP_PASS && !NØGLE);
 
 // Over Gmail findes ingen-svar@ ikke som adresse, så standarden er en, der gør.
 const FRA = process.env.MAIL_FROM
@@ -30,6 +31,9 @@ const FRA = process.env.MAIL_FROM
 const SVAR_FRA    = process.env.MAIL_SVAR_FROM || 'Lucca fra Lysmera <lucca@lysmera.dk>';
 const SVAR_TIL    = process.env.MAIL_SVAR_REPLY_TO || 'lucca@lysmera.dk';
 const KONTAKT_TIL = process.env.KONTAKT_MODTAGER || 'lucca@look-a.dk';
+// Resend lægger intet i postkassens "Sendt", så svarene får en kopi dertil.
+// Tom streng slår kopien fra.
+const SVAR_KOPI   = process.env.MAIL_SVAR_BCC ?? 'lucca@lysmera.dk';
 
 function erKonfigureret() {
   return BRUG_SMTP || Boolean(NØGLE);
@@ -59,13 +63,14 @@ function esc(s) {
   ));
 }
 
-async function send({ til, emne, html, tekst, fra = FRA, svarTil }) {
+async function send({ til, emne, html, tekst, fra = FRA, svarTil, kopi }) {
   if (!erKonfigureret()) return false;
   if (BRUG_SMTP) {
     try {
       await smtp().sendMail({
         from: fra, to: til, subject: emne, html, text: tekst,
         ...(svarTil ? { replyTo: svarTil } : {}),
+        ...(kopi ? { bcc: kopi } : {}),
       });
       return true;
     } catch (err) {
@@ -83,6 +88,7 @@ async function send({ til, emne, html, tekst, fra = FRA, svarTil }) {
       body: JSON.stringify({
         from: fra, to: [til], subject: emne, html, text: tekst,
         ...(svarTil ? { reply_to: svarTil } : {}),
+        ...(kopi ? { bcc: [kopi] } : {}),
       }),
       // Uden en grænse kan en langsom mailudbyder holde HTTP-svaret til ejeren
       // tilbage. Invitationen er allerede oprettet på det tidspunkt.
@@ -188,6 +194,7 @@ async function sendKontaktSvar({ til, navn, emne, tekst, oprindelig, dato }) {
     til,
     fra: SVAR_FRA,
     svarTil: SVAR_TIL,
+    kopi: SVAR_KOPI || undefined,
     emne,
     tekst: `${tekst}${citat}\n`,
     html:
