@@ -320,8 +320,12 @@ router.get('/team', authenticate, async (req, res) => {
  * Afventende invitationer tæller med. Ellers kunne ejeren invitere tyve og
  * først opdage loftet når den sjette sagde ja — og så ville de fjorten andre
  * have et link der ikke virker.
+ *
+ * `udenInvitation` er den invitation der er ved at blive sagt ja til. Den
+ * optager allerede en plads, og når den bliver til en bruger, er det den
+ * samme plads — talt med ville den sidste ledige plads aldrig kunne tages.
  */
-async function pladsOverblik(orgId) {
+async function pladsOverblik(orgId, udenInvitation = null) {
   const { rows } = await db.query(
     `SELECT (SELECT u.email FROM users u
               WHERE u.org_id = o.id AND u.role = 'owner'
@@ -330,10 +334,11 @@ async function pladsOverblik(orgId) {
               WHERE u.org_id = o.id AND u.is_active)              AS aktive,
             (SELECT COUNT(*)::int FROM team_invitations i
               WHERE i.org_id = o.id AND i.status = 'pending'
-                AND i.expires_at > NOW())                         AS afventende,
+                AND i.expires_at > NOW()
+                AND ($2::int IS NULL OR i.id <> $2))              AS afventende,
             o.paid_seats, o.requested_seats, o.stripe_subscription_id AS abonnement
        FROM organizations o WHERE o.id = $1`,
-    [orgId]
+    [orgId, udenInvitation]
   );
   const r = rows[0] ?? { aktive: 0, afventende: 0, paid_seats: 0, requested_seats: 0, abonnement: null };
   const fri = erFritaget(r.ejer_email);
@@ -356,8 +361,8 @@ async function pladsOverblik(orgId) {
 }
 
 /** Er der plads til én mere? Svarer med den besked brugeren skal se. */
-async function afvisHvisFuldt(orgId) {
-  const plads = await pladsOverblik(orgId);
+async function afvisHvisFuldt(orgId, udenInvitation = null) {
+  const plads = await pladsOverblik(orgId, udenInvitation);
   if (plads.ledige >= 1) return null;
   if (plads.fri) {
     return {
@@ -694,7 +699,7 @@ router.post('/invitations/:id/accept', authenticate, async (req, res) => {
       return res.json({ ok: true, flyttet: false });
     }
 
-    const fuldt = await afvisHvisFuldt(inv.org_id);
+    const fuldt = await afvisHvisFuldt(inv.org_id, inv.id);
     if (fuldt) {
       return res.status(409).json({
         error: 'Der er ikke flere pladser i det team lige nu. Sig til den der inviterede dig.',
@@ -790,7 +795,11 @@ router.get('/invite/:token', invitationLimiter, async (req, res) => {
       `SELECT i.name, i.email, i.role, i.status, i.expires_at,
               i.expires_at <= NOW() AS udloebet,
               o.name AS org_navn, u.name AS inviteret_af,
-              EXISTS (SELECT 1 FROM users x WHERE LOWER(x.email) = LOWER(i.email)) AS har_konto
+              EXISTS (SELECT 1 FROM users x WHERE LOWER(x.email) = LOWER(i.email)) AS har_konto,
+              -- En ejer-invitation til en konto uden brugere er en kunde, som
+              -- Lysmera har oprettet. Hun skal betale selv, ikke et team.
+              (i.role = 'owner'
+                AND NOT EXISTS (SELECT 1 FROM users y WHERE y.org_id = i.org_id)) AS ny_kunde
          FROM team_invitations i
          JOIN organizations o ON o.id = i.org_id
          LEFT JOIN users u ON u.id = i.invited_by
@@ -806,7 +815,7 @@ router.get('/invite/:token', invitationLimiter, async (req, res) => {
       invitation: {
         navn: inv.name, email: inv.email, rolle: inv.role,
         orgNavn: inv.org_navn, inviteretAf: inv.inviteret_af,
-        udløber: inv.expires_at, harKonto: inv.har_konto,
+        udløber: inv.expires_at, harKonto: inv.har_konto, nyKunde: inv.ny_kunde,
       },
     });
   } catch (err) {
@@ -851,7 +860,7 @@ router.post('/invite/:token', invitationLimiter, async (req, res) => {
       });
     }
 
-    const fuldt = await afvisHvisFuldt(inv.org_id);
+    const fuldt = await afvisHvisFuldt(inv.org_id, inv.id);
     if (fuldt) {
       return res.status(409).json({
         error: 'Der er ikke flere pladser i det team lige nu. Sig til den der inviterede dig.',

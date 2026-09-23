@@ -7,7 +7,10 @@
 'use strict';
 
 const express = require('express');
+const crypto  = require('crypto');
 const db      = require('../db');
+const appUrl  = require('../config/appUrl');
+const cvrService = require('../services/cvrService');
 const { authenticate } = require('../middleware/auth');
 const requirePlatformAdmin = require('../middleware/platformAdmin');
 const { erFritaget } = require('../middleware/subscription');
@@ -32,6 +35,15 @@ router.get('/overview', async (req, res) => {
               (SELECT u.email FROM users u
                  WHERE u.org_id = o.id AND u.role = 'owner'
                  ORDER BY u.id LIMIT 1)                                       AS ejer_email,
+              -- En kunde vi selv har oprettet har ingen ejer, før invitationen
+              -- er sagt ja til. Den står her, så kontoen ikke ligner en tom fejl.
+              (SELECT json_build_object('email', i.email, 'navn', i.name,
+                                        'udloeber', i.expires_at,
+                                        'udloebet', i.expires_at <= NOW())
+                 FROM team_invitations i
+                WHERE i.org_id = o.id AND i.role = 'owner' AND i.status = 'pending'
+                  AND NOT EXISTS (SELECT 1 FROM users u WHERE u.org_id = o.id)
+                ORDER BY i.created_at DESC LIMIT 1)                             AS afventer_ejer,
               (SELECT COUNT(*)::int FROM users u WHERE u.org_id = o.id AND u.is_active)  AS brugere,
               (SELECT COUNT(*)::int FROM users u WHERE u.org_id = o.id)                  AS brugere_i_alt,
               (SELECT COUNT(*)::int FROM leads l WHERE l.org_id = o.id)                  AS leads,
@@ -266,6 +278,157 @@ router.post('/beskeder/:id/svar', async (req, res) => {
   } catch (err) {
     console.error('[admin:besked:svar]', err.message);
     return res.status(500).json({ error: 'Kunne ikke sende svaret.' });
+  }
+});
+
+// ── Kunder oprettet af os ────────────────────────────────────────────────────
+// Til kunder man har talt med i telefonen: vi opretter virksomheden, og
+// kontaktpersonen får en ejer-invitation og vælger selv sin adgangskode. Vi
+// kender aldrig koden. Derefter er alt som ved en almindelig oprettelse —
+// prøveperioden og betalingen starter, når kunden logger ind første gang.
+
+const kundeLink = (token) => `${appUrl()}/invitation/${token}`;
+const nyToken = () => crypto.randomBytes(32).toString('base64url');
+
+/** Den afventende ejer-invitation på en konto der endnu ikke har brugere. */
+async function afventendeEjer(orgId) {
+  const { rows: [inv] } = await db.query(
+    `SELECT i.id, i.email, i.name, o.name AS org_navn
+       FROM team_invitations i
+       JOIN organizations o ON o.id = i.org_id
+      WHERE i.org_id = $1 AND i.role = 'owner' AND i.status = 'pending'
+        AND NOT EXISTS (SELECT 1 FROM users u WHERE u.org_id = o.id)
+      ORDER BY i.created_at DESC LIMIT 1`,
+    [orgId]
+  );
+  return inv ?? null;
+}
+
+// POST /api/admin/kunder — { cvr, navn, email, pladser? }
+router.post('/kunder', async (req, res) => {
+  const cvr     = String(req.body?.cvr ?? '').replace(/[\s\-.]/g, '');
+  const navn    = String(req.body?.navn ?? '').trim();
+  const email   = String(req.body?.email ?? '').trim().toLowerCase();
+  const pladser = Number(req.body?.pladser ?? 0);
+
+  if (!cvr || !navn || !email) {
+    return res.status(400).json({ error: 'CVR-nummer, navn og e-mail skal udfyldes.' });
+  }
+  if (!/^\d{8}$/.test(cvr)) {
+    return res.status(400).json({ error: 'Et dansk CVR-nummer er 8 cifre.' });
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ error: 'Skriv en gyldig e-mailadresse.' });
+  }
+  if (!Number.isInteger(pladser) || pladser < 0 || pladser > stripeService.MAKS_PLADSER) {
+    return res.status(400).json({ error: `Vælg mellem 0 og ${stripeService.MAKS_PLADSER} ekstra brugere.` });
+  }
+
+  try {
+    // En adresse med konto kan ikke blive ejer af en ny: den ville skulle
+    // forlade sit nuværende team, og det skal hun selv vælge.
+    const { rows: findes } = await db.query(
+      'SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
+    if (findes.length) {
+      return res.status(409).json({ error: 'Der findes allerede en bruger med den e-mail.', code: 'EMAIL_TAKEN' });
+    }
+
+    let firma;
+    try {
+      firma = await cvrService.lookupCompany(cvr);
+    } catch (err) {
+      if (err instanceof cvrService.CvrError) {
+        return res.status(err.status || 502).json({
+          error: 'CVR-registret svarer ikke lige nu. Prøv igen om lidt.', code: err.code });
+      }
+      throw err;
+    }
+    if (!firma) {
+      return res.status(404).json({ error: 'Der findes ingen virksomhed med det CVR-nummer.' });
+    }
+
+    const token = nyToken();
+    const org = await db.transaction(async (client) => {
+      const { rows: [o] } = await client.query(
+        'INSERT INTO organizations (name, cvr, requested_seats) VALUES ($1, $2, $3) RETURNING id, name',
+        [firma.name, cvr, pladser]
+      );
+      await client.query(
+        `INSERT INTO team_invitations (org_id, email, name, role, token, invited_by)
+         VALUES ($1, $2, $3, 'owner', $4, $5)`,
+        [o.id, email, navn, token, req.user.id]
+      );
+      return o;
+    });
+
+    // Som ved team-invitationer: mailen er en genvej. Fejler den, er kontoen
+    // oprettet alligevel, og linket står i svaret, så det kan sendes selv.
+    const mailSendt = await mailService.sendKundeInvitation({
+      til: email, navn, orgNavn: org.name, link: kundeLink(token),
+    });
+
+    return res.status(201).json({
+      kunde: { id: org.id, navn: org.name, cvr, email },
+      link: kundeLink(token),
+      mailSendt,
+    });
+  } catch (err) {
+    if (err.code === '23505' && err.constraint === 'organizations_cvr_key') {
+      return res.status(409).json({ error: 'Der findes allerede en konto for den virksomhed.', code: 'CVR_TAKEN' });
+    }
+    console.error('[admin:kunder:opret]', err.message);
+    return res.status(500).json({ error: 'Kunne ikke oprette kunden.' });
+  }
+});
+
+// POST /api/admin/kunder/:id/gensend — nyt link, 14 nye dage. Det gamle link
+// holder op med at virke, så et videresendt eller udløbet link ikke lever videre.
+router.post('/kunder/:id/gensend', async (req, res) => {
+  const orgId = Number(req.params.id);
+  if (!Number.isInteger(orgId)) return res.status(404).json({ error: 'Kunden findes ikke.' });
+
+  try {
+    const inv = await afventendeEjer(orgId);
+    if (!inv) {
+      return res.status(409).json({ error: 'Kunden har allerede aktiveret kontoen, eller der er ingen invitation.' });
+    }
+    const token = nyToken();
+    await db.query(
+      `UPDATE team_invitations SET token = $1, expires_at = NOW() + INTERVAL '14 days' WHERE id = $2`,
+      [token, inv.id]
+    );
+    const mailSendt = await mailService.sendKundeInvitation({
+      til: inv.email, navn: inv.name, orgNavn: inv.org_navn, link: kundeLink(token),
+    });
+    return res.json({ link: kundeLink(token), mailSendt });
+  } catch (err) {
+    console.error('[admin:kunder:gensend]', err.message);
+    return res.status(500).json({ error: 'Kunne ikke sende invitationen igen.' });
+  }
+});
+
+// DELETE /api/admin/kunder/:id — fortryd en oprettelse, fx en tastefejl i
+// mailen. Kun så længe ingen har logget ind og intet er sat op i Stripe;
+// derefter er det en rigtig kunde, og den slettes ikke herfra.
+router.delete('/kunder/:id', async (req, res) => {
+  const orgId = Number(req.params.id);
+  if (!Number.isInteger(orgId)) return res.status(404).json({ error: 'Kunden findes ikke.' });
+
+  try {
+    const { rowCount } = await db.query(
+      `DELETE FROM organizations o
+        WHERE o.id = $1 AND o.stripe_customer_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM users u WHERE u.org_id = o.id)
+          AND EXISTS (SELECT 1 FROM team_invitations i WHERE i.org_id = o.id AND i.role = 'owner')`,
+      [orgId]
+    );
+    if (!rowCount) {
+      return res.status(409).json({ error: 'Kun en kunde der endnu ikke har aktiveret kontoen, kan fortrydes.' });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[admin:kunder:slet]', err.message);
+    return res.status(500).json({ error: 'Kunne ikke fortryde oprettelsen.' });
   }
 });
 

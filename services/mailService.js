@@ -135,6 +135,41 @@ async function sendInvitation({ til, navn, orgNavn, inviteretAf, link }) {
 }
 
 /**
+ * En ny kunde, som Lysmera selv har oprettet. Kontoen og virksomheden findes
+ * allerede; modtageren skal kun vælge sin adgangskode. Sendt fra platformen,
+ * ikke fra et team, så teksten taler om kontoen og ikke om en invitation.
+ */
+async function sendKundeInvitation({ til, navn, orgNavn, link }) {
+  const hilsen = navn ? `Hej ${navn}` : 'Hej';
+
+  return send({
+    til,
+    emne: `Jeres Lysmera-konto til ${orgNavn} er klar`,
+    tekst:
+      `${hilsen}\n\nVi har oprettet en Lysmera-konto til ${orgNavn} med dig som ejer.\n\n` +
+      `Vælg din adgangskode her: ${link}\n\n` +
+      `Linket virker i 14 dage. Har du spørgsmål, så svar bare på denne mail.\n`,
+    html:
+      `<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:15px;line-height:1.6;color:#111">
+         <p>${esc(hilsen)}</p>
+         <p>Vi har oprettet en Lysmera-konto til <strong>${esc(orgNavn)}</strong> med dig som ejer.
+            Du skal kun vælge en adgangskode, så er du i gang.</p>
+         <p><a href="${esc(link)}" style="display:inline-block;background:#111;color:#fff;
+               padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:600">
+            Aktivér kontoen</a></p>
+         <p style="color:#555;font-size:13px">Virker knappen ikke, så kopier linket:<br>
+            <span style="word-break:break-all">${esc(link)}</span></p>
+         <p style="color:#555;font-size:13px">Linket virker i 14 dage.
+            Har du spørgsmål, så svar bare på denne mail.</p>
+       </div>`,
+    // Fra Lucca, ligesom svarene på kontaktbeskeder: "svar bare på denne
+    // mail" skal lande hos en person, ikke i en no-reply-postkasse.
+    fra: SVAR_FRA,
+    svarTil: SVAR_TIL,
+  });
+}
+
+/**
  * En ringeliste er sendt til en medarbejder. Som invitationen er mailen en
  * genvej: listen står på medarbejderens egen listeside, uanset om mailen når frem.
  */
@@ -207,5 +242,5 @@ async function sendKontaktSvar({ til, navn, emne, tekst, oprindelig, dato }) {
 }
 
 module.exports = {
-  erKonfigureret, sendInvitation, sendListeTildelt, sendKontaktNotifikation, sendKontaktSvar,
+  erKonfigureret, sendInvitation, sendKundeInvitation, sendListeTildelt, sendKontaktNotifikation, sendKontaktSvar,
 };

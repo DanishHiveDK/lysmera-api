@@ -1016,6 +1016,75 @@ async function main() {
       kig?.laesere === 2 && kig?.konti === 2 && kig?.visninger === 3, JSON.stringify(kig));
     check('fritagne konti tælles ikke med', !gTal.some((g) => g.slug === 'regler'), JSON.stringify(gTal));
 
+    // ── Kunder oprettet fra admin ────────────────────────────────────────────
+    section('Kunder oprettet fra admin');
+    const kundeMails = [];
+    const ægteKunde = mailSvc.sendKundeInvitation;
+    mailSvc.sendKundeInvitation = async (m) => { kundeMails.push(m); return true; };
+    const opretKunde = (body, token = adminToken) =>
+      call('/api/admin/kunder', { method: 'POST', token, body });
+
+    check('en kunde kan ikke oprette kunder',
+      (await opretKunde({ cvr: '11112222', navn: 'X', email: 'x@kunde.dk' }, tokenA)).status === 404);
+    check('ugyldigt CVR afvises',
+      (await opretKunde({ cvr: '123', navn: 'X', email: 'x@kunde.dk' })).status === 400);
+
+    const nyKunde = await opretKunde({ cvr: '11112222', navn: 'Kirsten Kunde', email: 'Kirsten@Kunde.dk', pladser: 0 });
+    check('admin opretter kunden med navnet fra CVR',
+      nyKunde.status === 201 && nyKunde.json.kunde.navn === 'Virksomhed 11112222 ApS' && nyKunde.json.mailSendt,
+      JSON.stringify(nyKunde.json));
+    check('mailen går til kontaktpersonen med linket',
+      kundeMails[0]?.til === 'kirsten@kunde.dk' && kundeMails[0]?.link === nyKunde.json.link);
+
+    check('samme CVR kan ikke oprettes to gange',
+      (await opretKunde({ cvr: '11112222', navn: 'Y', email: 'y@kunde.dk' })).json?.code === 'CVR_TAKEN');
+    check('en adresse med konto kan ikke blive ejer',
+      (await opretKunde({ cvr: '11113333', navn: 'A', email: 'a@example.dk' })).json?.code === 'EMAIL_TAKEN');
+
+    const kundeId = nyKunde.json.kunde.id;
+    const iOverblik = async () => ((await call('/api/admin/overview', { token: adminToken })).json?.konti ?? [])
+      .find((k) => k.id === kundeId);
+    check('overblikket viser at kunden afventer',
+      (await iOverblik())?.afventer_ejer?.email === 'kirsten@kunde.dk', JSON.stringify(await iOverblik()));
+
+    const gammeltToken = nyKunde.json.link.split('/').pop();
+    const gensendt = await call(`/api/admin/kunder/${kundeId}/gensend`, { method: 'POST', token: adminToken });
+    const nytToken = gensendt.json?.link?.split('/').pop();
+    check('invitationen kan sendes igen med et nyt link',
+      gensendt.status === 200 && nytToken && nytToken !== gammeltToken && kundeMails.length === 2);
+    check('det gamle link virker ikke længere',
+      (await call(`/api/auth/invite/${gammeltToken}`)).status === 404);
+
+    const visKunde = await call(`/api/auth/invite/${nytToken}`);
+    check('linket viser en ejer-invitation til virksomheden',
+      visKunde.json?.invitation?.rolle === 'owner' && visKunde.json?.invitation?.orgNavn === 'Virksomhed 11112222 ApS'
+      && visKunde.json?.invitation?.nyKunde === true, JSON.stringify(visKunde.json));
+
+    // Kontoen har ingen ekstra pladser: invitationen ER den ene plads. Talte
+    // den med ved sit eget ja, ville kunden aldrig kunne komme ind.
+    const kundeInd = await call(`/api/auth/invite/${nytToken}`, {
+      method: 'POST', body: { password: 'kundenskode123' } });
+    check('kunden vælger adgangskode og bliver ejer',
+      kundeInd.status === 201 && kundeInd.json.user.role === 'owner' && kundeInd.json.user.orgId === kundeId,
+      JSON.stringify(kundeInd.json));
+    const kundeStatus = await call('/api/billing/status', { token: kundeInd.json?.token });
+    check('kunden møder den almindelige betaling',
+      kundeStatus.status === 200 && kundeStatus.json.fritaget === false, JSON.stringify(kundeStatus.json));
+    check('overblikket viser ikke længere en afventende ejer', (await iOverblik())?.afventer_ejer === null);
+    check('en aktiveret kunde kan ikke gensendes',
+      (await call(`/api/admin/kunder/${kundeId}/gensend`, { method: 'POST', token: adminToken })).status === 409);
+    check('en aktiveret kunde kan ikke fortrydes',
+      (await call(`/api/admin/kunder/${kundeId}`, { method: 'DELETE', token: adminToken })).status === 409);
+    check('en almindelig konto kan ikke slettes herfra',
+      (await call(`/api/admin/kunder/${orgA.orgId}`, { method: 'DELETE', token: adminToken })).status === 409);
+
+    const fejltastet = await opretKunde({ cvr: '11114444', navn: 'Fejl', email: 'fejl@kunde.dk' });
+    const fortrudt = await call(`/api/admin/kunder/${fejltastet.json.kunde.id}`, { method: 'DELETE', token: adminToken });
+    const kundeTilbage = await db.query('SELECT COUNT(*)::int AS n FROM organizations WHERE cvr = $1', ['11114444']);
+    check('en oprettelse kan fortrydes før kunden logger ind',
+      fortrudt.status === 200 && kundeTilbage.rows[0].n === 0);
+    mailSvc.sendKundeInvitation = ægteKunde;
+
     section('Sletning');
     await call(`/api/lists/${listId}`, { method: 'DELETE', token: tokenA });
     const orphans = await db.query('SELECT COUNT(*)::int AS n FROM leads WHERE list_id = $1', [listId]);
