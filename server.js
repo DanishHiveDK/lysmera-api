@@ -85,6 +85,8 @@ app.use('/api/billing', require('./routes/billing'));
 app.use('/api/admin', require('./routes/admin'));
 // Offentlig: kontaktformularen på lysmera.dk. Skal stå før login-muren.
 app.use('/api/kontakt', require('./routes/kontakt'));
+// Offentlig: anonym besøgstæller (lysmera.dk + appens opret-side).
+app.use('/api/besoeg', require('./routes/besoeg'));
 // Guiderne er gratis og skal kunne læses uden abonnement.
 app.use('/api/guides', require('./routes/guides'));
 

@@ -126,6 +126,64 @@ router.get('/invoices', async (req, res) => {
   }
 });
 
+// ── GET /api/admin/besoeg?dage=30 ────────────────────────────────────────────
+// Besøgstragten: fra lysmera.dk til formularen, og fra appens opret-side til
+// en betalende konto. Hændelserne er anonyme dagstal (se routes/besoeg.js);
+// kontotrinene tælles i organizations, så de altid stemmer med Konti-fanen.
+router.get('/besoeg', async (req, res) => {
+  const dage = [7, 30, 90].includes(Number(req.query.dage)) ? Number(req.query.dage) : 30;
+  try {
+    const fra = `(NOW() AT TIME ZONE 'Europe/Copenhagen')::date - ($1::int - 1)`;
+    const [{ rows: haendelser }, { rows: kilder }, { rows: prDag }, { rows: konti }] = await Promise.all([
+      db.query(`SELECT haendelse, SUM(antal)::int AS antal FROM besoeg_taeller
+                 WHERE dag >= ${fra} GROUP BY haendelse`, [dage]),
+      db.query(`SELECT kilde, SUM(antal)::int AS antal FROM besoeg_taeller
+                 WHERE dag >= ${fra} AND haendelse = 'visning'
+                 GROUP BY kilde ORDER BY antal DESC`, [dage]),
+      db.query(`SELECT to_char(dag, 'YYYY-MM-DD') AS dag, haendelse, SUM(antal)::int AS antal
+                  FROM besoeg_taeller
+                 WHERE dag >= ${fra} AND haendelse IN ('visning', 'form_sendt')
+                 GROUP BY dag, haendelse ORDER BY dag`, [dage]),
+      // Kun konti kunderne selv har oprettet: dem vi opretter fra admin (med
+      // en ejer-invitation) er ikke et resultat af siden.
+      db.query(`SELECT o.subscription_status, o.stripe_customer_id IS NOT NULL AS har_kunde,
+                       (SELECT u.email FROM users u WHERE u.org_id = o.id AND u.role = 'owner'
+                         ORDER BY u.id LIMIT 1) AS ejer_email
+                  FROM organizations o
+                 WHERE (o.created_at AT TIME ZONE 'Europe/Copenhagen')::date >= ${fra}
+                   AND NOT EXISTS (SELECT 1 FROM team_invitations i
+                                    WHERE i.org_id = o.id AND i.role = 'owner')`, [dage]),
+    ]);
+
+    const n = Object.fromEntries(haendelser.map((r) => [r.haendelse, r.antal]));
+    const egne = konti.filter((k) => !erFritaget(k.ejer_email));
+
+    return res.json({
+      dage,
+      landing: [
+        { trin: 'visning',    navn: 'Besøg på lysmera.dk',   antal: n.visning ?? 0 },
+        { trin: 'funktioner', navn: 'Så "Funktioner"',       antal: n.funktioner ?? 0 },
+        { trin: 'saadan',     navn: 'Så "Sådan virker det"', antal: n.saadan ?? 0 },
+        { trin: 'adgang',     navn: 'Nåede formularen',      antal: n.adgang ?? 0 },
+        { trin: 'form_start', navn: 'Begyndte at udfylde',   antal: n.form_start ?? 0 },
+        { trin: 'form_sendt', navn: 'Sendte formularen',     antal: n.form_sendt ?? 0 },
+      ],
+      klik: { cta: n.cta ?? 0, login: n.login ?? 0 },
+      app: [
+        { trin: 'opret_visning', navn: 'Åbnede "Opret konto"',   antal: n.opret_visning ?? 0 },
+        { trin: 'oprettet',      navn: 'Oprettede en konto',     antal: egne.length },
+        { trin: 'proeve',        navn: 'Startede prøveperioden', antal: egne.filter((k) => k.har_kunde).length },
+        { trin: 'betaler',       navn: 'Betaler nu',             antal: egne.filter((k) => k.subscription_status === 'active').length },
+      ],
+      kilder,
+      prDag,
+    });
+  } catch (err) {
+    console.error('[admin:besoeg]', err.message);
+    return res.status(500).json({ error: 'Kunne ikke hente besøgstallene.' });
+  }
+});
+
 // ── GET /api/admin/guides ────────────────────────────────────────────────────
 // Hvor mange har åbnet hver guide. Vores egne konti tælles ikke med — ellers
 // ville vores egen korrekturlæsning se ud som interesse.

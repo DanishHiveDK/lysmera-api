@@ -1016,6 +1016,39 @@ async function main() {
       kig?.laesere === 2 && kig?.konti === 2 && kig?.visninger === 3, JSON.stringify(kig));
     check('fritagne konti tælles ikke med', !gTal.some((g) => g.slug === 'regler'), JSON.stringify(gTal));
 
+    section('Besøgstæller');
+    const besøg = (body, { ip = '10.1.0.1', ua = 'Mozilla/5.0' } = {}) => fetch(`${BASE}/api/besoeg`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Klient-IP': ip, 'X-Klient-UA': ua },
+      body: JSON.stringify(body),
+    }).then((r) => r.status);
+    check('tælleren kræver ikke login', (await besøg({ h: 'visning', ref: 'https://www.google.com/' })) === 204);
+    await besøg({ h: 'visning', ref: 'https://www.linkedin.com/feed/' });
+    await besøg({ h: 'visning', ref: '', utm: 'Nyhedsbrev Okt!' });
+    await besøg({ h: 'adgang' });
+    await besøg({ h: 'form_sendt', ref: 'https://www.google.com/' }); // kilde gemmes kun for visninger
+    check('ukendte hændelser afvises', (await besøg({ h: 'DROP TABLE' })) === 400);
+    await besøg({ h: 'visning' }, { ua: 'Googlebot/2.1' });
+    const bRækker = (await db.query(`SELECT haendelse, kilde, antal FROM besoeg_taeller ORDER BY haendelse, kilde`)).rows;
+    const bTal = (h, k) => bRækker.find((r) => r.haendelse === h && r.kilde === k)?.antal ?? 0;
+    check('kilden grupperes groft', bTal('visning', 'søgning') === 1 && bTal('visning', 'linkedin') === 1
+      && bTal('visning', 'utm:nyhedsbrevokt') === 1, JSON.stringify(bRækker));
+    check('robotter tælles ikke', bTal('visning', 'direkte') === 0, JSON.stringify(bRækker));
+    check('kun visninger får en kilde', bTal('form_sendt', '') === 1);
+    let bloft = 204;
+    for (let i = 0; i < 61; i++) bloft = await besøg({ h: 'cta' }, { ip: '10.1.0.9' });
+    const ctaTal = (await db.query(`SELECT SUM(antal)::int AS n FROM besoeg_taeller WHERE haendelse = 'cta'`)).rows[0].n;
+    check('loftet bremser stille (204, men tæller ikke)', bloft === 204 && ctaTal === 60, `n=${ctaTal}`);
+    check('en kunde kan ikke se besøgstallene',
+      (await call('/api/admin/besoeg', { token: tokenA })).status === 404);
+    const bAdmin = (await call('/api/admin/besoeg?dage=7', { token: adminToken })).json;
+    check('admin ser tragten', bAdmin?.landing?.[0]?.antal === 3 && bAdmin?.landing?.[3]?.antal === 1
+      && bAdmin?.klik?.cta === 60, JSON.stringify(bAdmin?.landing));
+    check('admin ser kilder og dagstal', bAdmin?.kilder?.length === 3 && bAdmin?.prDag?.length === 2,
+      JSON.stringify({ k: bAdmin?.kilder, d: bAdmin?.prDag }));
+    check('kontotrin tæller kun selvoprettede, ikke-fritagne konti',
+      Number.isInteger(bAdmin?.app?.[1]?.antal) && bAdmin.app[1].antal >= 1, JSON.stringify(bAdmin?.app));
+
     // ── Kunder oprettet fra admin ────────────────────────────────────────────
     section('Kunder oprettet fra admin');
     const kundeMails = [];
