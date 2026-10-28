@@ -7,6 +7,7 @@ const db        = require('../db');
 const rateLimit = require('express-rate-limit');
 const cvr       = require('../services/cvrService');
 const { sanitizeFilters } = require('../services/filterSchema');
+const { begrænsFiltre } = require('../middleware/funktioner');
 const { authenticate }    = require('../middleware/auth');
 const options   = require('../config/cvrOptions');
 
@@ -106,6 +107,7 @@ router.get('/meta/options', authenticate, (req, res) => {
 // ── POST /api/search — paged preview of a filter ─────────────────────────────
 router.post('/search', authenticate, searchLimiter, async (req, res) => {
   const filters = sanitizeFilters(req.body?.filters ?? req.body ?? {});
+  begrænsFiltre(filters, req.user?.email);
   try {
     const { total, results } = await cvr.searchCompanies({
       filters,
@@ -148,6 +150,7 @@ router.get('/new-companies', authenticate, searchLimiter, async (req, res) => {
   // Reuse the shared filter validation, then pin the date window. A caller
   // cannot widen it past `days` by also sending establishedFrom.
   const filters = sanitizeFilters({ ...req.query, establishedFrom: since, establishedTo: undefined });
+  begrænsFiltre(filters, req.user?.email);
 
   try {
     const { total, results } = await cvr.searchCompanies({

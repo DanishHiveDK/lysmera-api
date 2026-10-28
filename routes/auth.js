@@ -12,6 +12,7 @@ const cvrService = require('../services/cvrService');
 const stripeService = require('../services/stripeService');
 const mailService = require('../services/mailService');
 const { erPlatformAdmin } = require('../middleware/platformAdmin');
+const { harHjemmesideFilter } = require('../middleware/funktioner');
 const { erFritaget, GRATIS_TEAMPLADSER } = require('../middleware/subscription');
 const { authenticate, requireOwner, signToken } = require('../middleware/auth');
 
@@ -98,6 +99,7 @@ router.post('/login', loginLimiter, async (req, res) => {
         // Adgang til admin-siden. Sendes med, så frontenden ved om linket skal
         // vises — men API'et afgør selv adgangen ved hvert kald.
         platformAdmin: erPlatformAdmin(user.email),
+        hjemmesideFilter: harHjemmesideFilter(user.email),
       },
     });
   } catch (err) {
@@ -208,6 +210,7 @@ router.post('/register', registerLimiter, async (req, res) => {
         id: user.id, name: user.name, email: user.email, role: user.role,
         orgId: user.org_id, orgName: user.org_name,
         platformAdmin: erPlatformAdmin(user.email),
+        hjemmesideFilter: harHjemmesideFilter(user.email),
       },
     });
   } catch (err) {
@@ -236,6 +239,7 @@ router.get('/me', authenticate, async (req, res) => {
         id: req.user.id, name: req.user.name, email: req.user.email,
         role: req.user.role, orgId: req.orgId, orgName: rows[0]?.name ?? null,
         platformAdmin: erPlatformAdmin(req.user.email),
+        hjemmesideFilter: harHjemmesideFilter(req.user.email),
       },
     });
   } catch (err) {
@@ -274,6 +278,7 @@ router.patch('/me', authenticate, async (req, res) => {
         id: bruger.id, name: bruger.name, email: bruger.email, role: bruger.role,
         orgId: bruger.org_id, orgName: org[0]?.name ?? null,
         platformAdmin: erPlatformAdmin(bruger.email),
+        hjemmesideFilter: harHjemmesideFilter(bruger.email),
       },
     });
   } catch (err) {
@@ -757,6 +762,7 @@ router.post('/invitations/:id/accept', authenticate, async (req, res) => {
         id: bruger.id, name: bruger.name, email: bruger.email, role: bruger.role,
         orgId: bruger.org_id, orgName: inv.org_navn,
         platformAdmin: erPlatformAdmin(bruger.email),
+        hjemmesideFilter: harHjemmesideFilter(bruger.email),
       },
     });
   } catch (err) {
@@ -890,6 +896,7 @@ router.post('/invite/:token', invitationLimiter, async (req, res) => {
         id: bruger.id, name: bruger.name, email: bruger.email, role: bruger.role,
         orgId: bruger.org_id, orgName: inv.org_navn,
         platformAdmin: erPlatformAdmin(bruger.email),
+        hjemmesideFilter: harHjemmesideFilter(bruger.email),
       },
     });
   } catch (err) {

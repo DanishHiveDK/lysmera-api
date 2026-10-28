@@ -51,6 +51,9 @@ function sanitizeFilters(raw = {}) {
     establishedTo:    toDate(raw.establishedTo),
     requirePhone:     raw.requirePhone === true || raw.requirePhone === 'true',
     requireEmail:     raw.requireEmail === true || raw.requireEmail === 'true',
+    // 'med' eller 'uden' hjemmeside i CVR. Kun for udvalgte konti — se
+    // middleware/funktioner.js; ruterne fjerner det for alle andre.
+    website:          ['med', 'uden'].includes(raw.website) ? raw.website : null,
     // Frasorterer virksomheder organisationen allerede har som lead. Bruges
     // i rutelaget, ikke i CVR-forespørgslen — registret kender ikke vores
     // database.

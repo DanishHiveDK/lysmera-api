@@ -6,6 +6,7 @@ const express = require('express');
 const db      = require('../db');
 const cvr     = require('../services/cvrService');
 const { sanitizeFilters, isEmptyFilter } = require('../services/filterSchema');
+const { begrænsFiltre } = require('../middleware/funktioner');
 const { authenticate } = require('../middleware/auth');
 const { handleCvrError } = require('./search');
 const { STATUS_VALUES, TERMINAL_STATUSES } = require('../config/cvrOptions');
@@ -225,6 +226,7 @@ router.post('/lists', authenticate, async (req, res) => {
   }
 
   const filters = sanitizeFilters(req.body?.filters ?? {});
+  begrænsFiltre(filters, req.user?.email);
   if (isEmptyFilter(filters)) {
     return res.status(400).json({
       error: 'Vælg mindst ét filter — branche, område, størrelse eller søgeord.',

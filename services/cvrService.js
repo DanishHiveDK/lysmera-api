@@ -85,7 +85,8 @@ class CvrError extends Error {
  * filters = {
  *   query, industryCodes[], zipFrom, zipTo, zipCodes[], municipalities[],
  *   companyForms[], employeesMin, employeesMax, establishedFrom, establishedTo,
- *   requirePhone, requireEmail, onlyActive, includeAdvertisingProtected
+ *   requirePhone, requireEmail, website ('med'|'uden'), onlyActive,
+ *   includeAdvertisingProtected
  * }
  */
 /**
@@ -246,6 +247,18 @@ function buildQuery(filters = {}) {
     // sideordnet objekt, så det her er kun en billig forhåndsfrasortering.
     // applyPostFilters gør det rigtige arbejde bagefter.
     filter.push({ exists: { field: `${FIELD}.elektroniskPost.kontaktoplysning` } });
+  }
+
+  if (filters.website === 'med') {
+    // Billig forhåndsfrasortering som ved telefon og mail; applyPostFilters
+    // smider dem ud, hvis eneste hjemmeside er udløbet.
+    filter.push({ exists: { field: `${FIELD}.hjemmeside.kontaktoplysning` } });
+  } else if (filters.website === 'uden') {
+    // Her er det omvendt: ingen post overhovedet. Et firma, hvis eneste
+    // hjemmeside er udløbet, kommer derfor ikke med — det er prisen for at
+    // tallet i toppen passer. Efterfiltrering ville give sider med færre end
+    // 25 og et total, der lyver.
+    mustNot.push({ exists: { field: `${FIELD}.hjemmeside.kontaktoplysning` } });
   }
 
   const bool = {};
@@ -531,6 +544,7 @@ function applyPostFilters(companies, filters) {
   let ud = companies;
   if (filters?.requirePhone) ud = ud.filter((c) => Boolean(c.phone));
   if (filters?.requireEmail) ud = ud.filter((c) => Boolean(c.email));
+  if (filters?.website === 'med') ud = ud.filter((c) => Boolean(c.website));
   return ud;
 }
 
