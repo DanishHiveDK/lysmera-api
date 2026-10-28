@@ -92,7 +92,7 @@ router.post('/login', loginLimiter, async (req, res) => {
     await db.query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id]);
 
     return res.json({
-      token: signToken(user),
+      token: signToken(user, { husk: req.body?.husk === true }),
       user: {
         id: user.id, name: user.name, email: user.email, role: user.role,
         orgId: user.org_id, orgName: user.org_name,
@@ -205,7 +205,7 @@ router.post('/register', registerLimiter, async (req, res) => {
     });
 
     return res.status(201).json({
-      token: signToken(user),
+      token: signToken(user, { husk: req.body?.husk === true }),
       user: {
         id: user.id, name: user.name, email: user.email, role: user.role,
         orgId: user.org_id, orgName: user.org_name,
@@ -235,6 +235,8 @@ router.get('/me', authenticate, async (req, res) => {
   try {
     const { rows } = await db.query('SELECT name FROM organizations WHERE id = $1', [req.orgId]);
     return res.json({
+      // "Husk mig": nyt token med fuld levetid ved hver åbning af appen.
+      ...(req.husk ? { token: signToken(req.user, { husk: true }) } : {}),
       user: {
         id: req.user.id, name: req.user.name, email: req.user.email,
         role: req.user.role, orgId: req.orgId, orgName: rows[0]?.name ?? null,
@@ -273,7 +275,7 @@ router.patch('/me', authenticate, async (req, res) => {
     // Nyt token: navn og e-mail står i nyttelasten, og et token med det gamle
     // navn ville få brugerfladen til at vise det gamle indtil næste login.
     return res.json({
-      token: signToken(bruger),
+      token: signToken(bruger, { husk: req.husk }),
       user: {
         id: bruger.id, name: bruger.name, email: bruger.email, role: bruger.role,
         orgId: bruger.org_id, orgName: org[0]?.name ?? null,
@@ -757,7 +759,7 @@ router.post('/invitations/:id/accept', authenticate, async (req, res) => {
     return res.json({
       ok: true,
       flyttet: true,
-      token: signToken(bruger),
+      token: signToken(bruger, { husk: req.husk }),
       user: {
         id: bruger.id, name: bruger.name, email: bruger.email, role: bruger.role,
         orgId: bruger.org_id, orgName: inv.org_navn,

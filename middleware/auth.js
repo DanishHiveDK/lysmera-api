@@ -12,12 +12,18 @@ if (!SECRET) {
 }
 
 const TOKEN_TTL = process.env.JWT_TTL || '12h';
+// "Husk mig": et længere token, der fornyes hver gang appen åbnes (GET /auth/me).
+// Så forbliver man logget ind, så længe man bruger Lysmera mindst én gang i
+// perioden. `husk` står i nyttelasten, så et token der udstedes på ny (ny
+// profil, skiftet organisation) beholder samme levetid.
+const HUSK_TTL = process.env.JWT_HUSK_TTL || '30d';
 
-function signToken(user) {
+function signToken(user, { husk = false } = {}) {
   return jwt.sign(
-    { id: user.id, orgId: user.org_id, email: user.email, role: user.role, name: user.name },
+    { id: user.id, orgId: user.org_id, email: user.email, role: user.role, name: user.name,
+      ...(husk ? { husk: true } : {}) },
     SECRET,
-    { expiresIn: TOKEN_TTL }
+    { expiresIn: husk ? HUSK_TTL : TOKEN_TTL }
   );
 }
 
@@ -51,6 +57,7 @@ async function authenticate(req, res, next) {
     }
     req.user = user;
     req.orgId = user.org_id;
+    req.husk = payload.husk === true;
     next();
   } catch (err) {
     console.error('[auth]', err.message);

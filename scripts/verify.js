@@ -212,11 +212,21 @@ async function main() {
     const tokenA = loginA.json.token;
 
     const loginB = await call('/api/auth/login', {
-      method: 'POST', body: { email: 'b@example.dk', password: 'hemmeligkode123' } });
+      method: 'POST', body: { email: 'b@example.dk', password: 'hemmeligkode123', husk: true } });
     const tokenB = loginB.json.token;
 
     const me = await call('/api/auth/me', { token: tokenA });
     check('/auth/me returnerer org-navn', me.json?.user?.orgName === 'Firma A ApS');
+    check('uden "husk mig" fornyes tokenet ikke', !me.json?.token);
+
+    // "Husk mig": langt token, der fornyes ved hver /auth/me.
+    const levetid = (t) => { const p = JSON.parse(Buffer.from(t.split('.')[1], 'base64url')); return p.exp - p.iat; };
+    // (B logger ind med "husk mig" ovenfor — et ekstra login ville ramme loginbegrænseren.)
+    check('"husk mig" giver et token på 30 dage', levetid(tokenB) === 30 * 86400);
+    check('almindeligt login giver et token på 12 timer', levetid(tokenA) === 12 * 3600);
+    const huskMe = await call('/api/auth/me', { token: tokenB });
+    check('/auth/me fornyer et "husk mig"-token',
+      !!huskMe.json?.token && levetid(huskMe.json.token) === 30 * 86400);
 
     const noAuth = await call('/api/lists');
     check('beskyttet rute kræver token', noAuth.status === 401);
